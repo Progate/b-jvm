@@ -34,11 +34,11 @@ target_link_libraries(vm PUBLIC stb_ds)
 target_link_libraries(vm PRIVATE m)
 
 if (BJVM_LINUX_MUSL)
-    # the musl sysroot ships no zlib, so the fetched one gets built for wasm32 too. zlibstatic does not export
-    # its include directories, and zconf.h is generated into the build tree, so both have to be added here.
-    FetchContent_MakeAvailable(zlib)
-    target_link_libraries(vm PRIVATE zlibstatic)
-    target_include_directories(vm PUBLIC ${zlib_SOURCE_DIR} ${zlib_BINARY_DIR})
+    # The BrowserOS sysroot ships zlib as a system library (libz.so, plus zlib.h and libz.a), the same way a
+    # Linux distribution does, so link that one dynamically instead of building a private copy: bjvm.wasm
+    # gets NEEDED libz.so and the loader shares the one libz.so with every other program in the OS.
+    find_package(ZLIB REQUIRED)
+    target_link_libraries(vm PRIVATE ZLIB::ZLIB)
 elseif (NOT EMSCRIPTEN)
     FetchContent_MakeAvailable(zlib)
     target_link_libraries(vm PRIVATE z)
