@@ -2541,6 +2541,12 @@ static s64 athrow_impl_int(ARGS_INT) {
 
 static s64 checkcast_impl_int(ARGS_INT) {
   DEBUG_CHECK();
+  // null はクラスを解決せずに通す（HotSpot と同じ）。IntelliJ の FileUtil は、無い trove の型への
+  // checkcast に null を通す作りで、解決しに行くと ClassNotFoundException になる。
+  // 書き換えずに戻るので、null でない値が来たときに改めて解決する
+  if (!tos) {
+    NEXT_INT(tos)
+  }
   cp_class_info *info = &insn->cp->class_info;
   SPILL(tos)
   int error = resolve_class(thread, info) || link_class(thread, info->classdesc);
@@ -2566,6 +2572,10 @@ static s64 checkcast_resolved_impl_int(ARGS_INT) {
 
 static s64 instanceof_impl_int(ARGS_INT) {
   DEBUG_CHECK();
+  // null instanceof X は解決せずに false（checkcast と同じ理由）
+  if (!tos) {
+    NEXT_INT(0)
+  }
   cp_class_info *info = &insn->cp->class_info;
   SPILL(tos)
   int error = resolve_class(thread, info) || link_class(thread, info->classdesc);

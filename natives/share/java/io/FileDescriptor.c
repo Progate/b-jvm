@@ -17,3 +17,11 @@ DECLARE_NATIVE("java/io", FileDescriptor, close0, "()V") {
   StoreFieldInt(obj->obj, "fd", -1);
   return value_null();
 }
+
+// FileDescriptor が GC で回収されたときに閉じる（Cleaner から呼ばれる）。無いと Cleaner のスレッドで
+// UnsatisfiedLinkError が出る（kotlinc が開いたまま捨てるストリームで出ていた）
+DECLARE_NATIVE("java/io", FileCleanable, cleanupClose0, "(IJ)V") {
+  if (args[0].i != -1)
+    close(args[0].i);
+  return value_null();
+}
