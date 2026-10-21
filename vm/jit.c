@@ -33,7 +33,9 @@
 #include <stdlib.h>
 #include <string.h>
 
-#if defined(__wasi__)
+// bjvm_jit.install is a host import that exists on every wasm reactor the BrowserOS host runs
+// (WASI or Linux-musl); Emscripten and native builds keep the interpreter only.
+#if defined(__wasm__) && !defined(EMSCRIPTEN)
 #define JIT_SUPPORTED 1
 __attribute__((import_module("bjvm_jit"), import_name("install"))) int32_t jit_host_install(const u8 *bytes, u32 len);
 #else

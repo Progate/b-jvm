@@ -35,11 +35,9 @@ DECLARE_NATIVE("sun/nio/ch", IOUtil, drain, "(I)Z") {
     return (stack_value){.i = 1};
   }
   u8 buf[512];
-  __wasi_iovec_t iov = {.buf = buf, .buf_len = sizeof buf};
-  __wasi_size_t nread;
   for (;;) {
-    __wasi_errno_t e = __wasi_fd_read(fd, &iov, 1, &nread);
-    if (e != 0 || nread == 0)
+    ssize_t nread = read(fd, buf, sizeof buf);
+    if (nread <= 0)
       break;
   }
   return (stack_value){.i = 1};
@@ -55,10 +53,8 @@ DECLARE_NATIVE("sun/nio/ch", IOUtil, drain1, "(I)I") {
     return (stack_value){.i = had};
   }
   u8 b;
-  __wasi_iovec_t iov = {.buf = &b, .buf_len = 1};
-  __wasi_size_t nread = 0;
-  __wasi_fd_read(fd, &iov, 1, &nread);
-  return (stack_value){.i = nread ? 1 : 0};
+  ssize_t nread = read(fd, &b, 1);
+  return (stack_value){.i = nread > 0 ? 1 : 0};
 }
 
 DECLARE_NATIVE("sun/nio/ch", IOUtil, write1, "(IB)I") {
@@ -69,18 +65,22 @@ DECLARE_NATIVE("sun/nio/ch", IOUtil, write1, "(IB)I") {
     return (stack_value){.i = 1};
   }
   u8 b = (u8)args[1].i;
-  __wasi_ciovec_t iov = {.buf = &b, .buf_len = 1};
-  __wasi_size_t nwritten = 0;
-  __wasi_errno_t e = __wasi_fd_write(fd, &iov, 1, &nwritten);
-  return (stack_value){.i = e ? BJVM_IOS_THROWN : (s32)nwritten};
+  ssize_t nwritten = write(fd, &b, 1);
+  return (stack_value){.i = nwritten < 0 ? BJVM_IOS_THROWN : (s32)nwritten};
 }
 
 DECLARE_NATIVE("sun/nio/ch", IOUtil, randomBytes, "([B)Z") {
   obj_header *arr = args[0].handle->obj;
   u8 *data = ArrayData(arr);
   u32 len = ArrayLength(arr);
-  __wasi_errno_t e = __wasi_random_get(data, len);
-  return (stack_value){.i = e == 0};
+  u32 off = 0;
+  while (off < len) {
+    ssize_t n = getrandom(data + off, len - off, 0);
+    if (n < 0)
+      return (stack_value){.i = 0};
+    off += (u32)n;
+  }
+  return (stack_value){.i = 1};
 }
 
 // No pipes in this runtime; callers fall back to sockets or eventfds.

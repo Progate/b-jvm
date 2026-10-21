@@ -2,51 +2,37 @@
 #define BJVM_NET_H
 
 /*
- * Socket natives for sun.nio.ch, backed by the WASI preview1 socket
- * extensions that BrowserOS registers for every guest (sock_open /
- * sock_bind / sock_listen / sock_connect / sock_getlocaladdr /
- * sock_getpeeraddr / sock_getsockopt / sock_setsockopt) plus the standard
- * fd_read / fd_write / poll_oneoff / sock_accept. Blocking ops are
- * emulated by nonblocking polling plus round-robin scheduler yields so a
- * blocked Java thread does not stall the whole VM.
+ * Socket natives for sun.nio.ch, backed by ordinary POSIX socket and fd
+ * calls (socket/bind/listen/connect/accept4/getsockname/getpeername/
+ * getsockopt/setsockopt/readv/writev/recvmsg/sendmsg/shutdown/close/poll),
+ * which under the wasm32-unknown-linux-musl build the BrowserOS kernel
+ * serves through browser_os_linux.syscall. The level/opt ints the JDK
+ * passes to getsockopt/setsockopt are the real Linux constants
+ * (SocketOptionRegistry is generated from the JDK build's headers), so
+ * they go through verbatim.
+ *
+ * Sockets are created O_NONBLOCK and stay that way: a blocking-mode Java
+ * read is emulated by nonblocking polling plus round-robin scheduler
+ * yields, so a blocked Java thread does not stall the single-threaded VM.
+ * bjvm_nonblock_fds records the *JDK-level* blocking mode, which decides
+ * between UNAVAILABLE and keep-polling.
  *
  * Intentionally missing: IPv6 (isIPv6Available0 reports false so the JDK
- * takes the IPv4 path everywhere), UDP, and host name resolution
- * (InetAddressImpl answers "localhost" only).
+ * takes the IPv4 path everywhere), UDP multicast groups, and host name
+ * resolution (InetAddressImpl answers "localhost" only).
  */
 
 #include <natives-dsl.h>
 #include <roundrobin_scheduler.h>
-#include <wasi/api.h>
 
-#define BJVM_WASI_IMPORT(name) __attribute__((import_module("wasi_snapshot_preview1"), import_name(name)))
-
-// BrowserOS socket extensions (browser-wasi p1/sockets.ts). Addresses are
-// passed as a pointer to a ciovec-like {buf, bufLen} containing either 4
-// raw IPv4 bytes, 16 raw IPv6 bytes, or a 128-byte sockaddr_any
-// {family:u16, addr:...}. Families (BSD values): 1=inet, 2=inet6. socktype 2=stream.
-BJVM_WASI_IMPORT("sock_open")
-__wasi_errno_t bjvm_sock_open(u32 family, u32 socktype, __wasi_fd_t *result_fd);
-BJVM_WASI_IMPORT("sock_bind")
-__wasi_errno_t bjvm_sock_bind(__wasi_fd_t fd, const void *addrbuf, u32 port);
-BJVM_WASI_IMPORT("sock_listen")
-__wasi_errno_t bjvm_sock_listen(__wasi_fd_t fd, u32 backlog);
-BJVM_WASI_IMPORT("sock_connect")
-__wasi_errno_t bjvm_sock_connect(__wasi_fd_t fd, const void *addrbuf, u32 port);
-BJVM_WASI_IMPORT("sock_getlocaladdr")
-__wasi_errno_t bjvm_sock_getlocaladdr(__wasi_fd_t fd, void *addrbuf, u32 *port);
-BJVM_WASI_IMPORT("sock_getpeeraddr")
-__wasi_errno_t bjvm_sock_getpeeraddr(__wasi_fd_t fd, void *addrbuf, u32 *port);
-BJVM_WASI_IMPORT("sock_getsockopt")
-__wasi_errno_t bjvm_sock_getsockopt(__wasi_fd_t fd, u32 level, u32 name, void *value, u32 value_len);
-BJVM_WASI_IMPORT("sock_setsockopt")
-__wasi_errno_t bjvm_sock_setsockopt(__wasi_fd_t fd, u32 level, u32 name, const void *value, u32 value_len);
-BJVM_WASI_IMPORT("sock_recv_from")
-__wasi_errno_t bjvm_sock_recv_from(__wasi_fd_t fd, const __wasi_iovec_t *iovs, u32 iovs_len,
-                                   const void *addrbuf, u32 flags, u32 *port, __wasi_size_t *nread, u16 *oflags);
-BJVM_WASI_IMPORT("sock_send_to")
-__wasi_errno_t bjvm_sock_send_to(__wasi_fd_t fd, const __wasi_ciovec_t *iovs, u32 iovs_len,
-                                 const void *addrbuf, u32 port, u32 flags, __wasi_size_t *nwritten);
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <sys/random.h>
+#include <sys/socket.h>
+#include <sys/uio.h>
+#include <netinet/in.h>
+#include <unistd.h>
 
 // JDK IOStatus codes
 #define BJVM_IOS_EOF (-1)
@@ -56,7 +42,7 @@ __wasi_errno_t bjvm_sock_send_to(__wasi_fd_t fd, const __wasi_ciovec_t *iovs, u3
 #define BJVM_IOS_THROWN (-5)
 
 // Fake fd space. EventFDs and epoll instances are VM-internal objects the
-// host fd table knows nothing about, so they get numbers no real fd can
+// kernel fd table knows nothing about, so they get numbers no real fd can
 // take. Any site that closes/drains/polls an fd must special-case them.
 #define BJVM_FAKE_FD_BASE 0x20000
 
@@ -116,15 +102,11 @@ static inline bool bjvm_fd_is_nonblock(int fd) {
   return false;
 }
 
+// Only updates the bookkeeping: real fds stay O_NONBLOCK regardless (a
+// "blocking" Java socket is the yield loop over EAGAIN, not a blocking
+// syscall — there is no other thread to run while we sleep). Clearing
+// O_NONBLOCK on a blocking-mode channel would hang the whole VM.
 static void bjvm_fd_set_nonblock(int fd, bool nonblock) {
-  if (!bjvm_is_fake_fd(fd)) {
-    __wasi_fdstat_t stat;
-    if (__wasi_fd_fdstat_get(fd, &stat) == 0) {
-      __wasi_fdflags_t flags = nonblock ? (stat.fs_flags | __WASI_FDFLAGS_NONBLOCK)
-                                        : (stat.fs_flags & ~(__wasi_fdflags_t)__WASI_FDFLAGS_NONBLOCK);
-      (void)__wasi_fd_fdstat_set_flags(fd, flags);
-    }
-  }
   for (u32 i = 0; i < arrlen(bjvm_nonblock_fds); ++i) {
     if (bjvm_nonblock_fds[i] == fd) {
       if (!nonblock)
@@ -140,114 +122,119 @@ static inline int bjvm_fd_val(obj_header *fd_obj) {
   return fd_obj ? LoadFieldInt(fd_obj, "fd") : -1;
 }
 
-static void bjvm_throw_sock(vm_thread *thread, __wasi_errno_t errno_, const char *what) {
+static void bjvm_throw_sock(vm_thread *thread, int errno_, const char *what) {
   char msg[128];
   snprintf(msg, sizeof msg, "%s: errno %d", what, (int)errno_);
   raise_vm_exception(thread, STR("java/net/SocketException"), hslc((heap_string){.chars = msg, .len = (u32)strlen(msg)}));
 }
 
-static void bjvm_throw_io(vm_thread *thread, __wasi_errno_t errno_, const char *what) {
+static void bjvm_throw_io(vm_thread *thread, int errno_, const char *what) {
   char msg[128];
   snprintf(msg, sizeof msg, "%s: errno %d", what, (int)errno_);
   raise_vm_exception(thread, STR("java/io/IOException"), hslc((heap_string){.chars = msg, .len = (u32)strlen(msg)}));
 }
 
-// Generic fd_read / fd_write I/O, shared by the stream and datagram
+// Generic readv / writev I/O, shared by the stream and datagram
 // dispatchers (both operate on plain fds). `address` is Unsafe-allocated
 // native memory; readv/writev take a struct iovec[] there where wasm32
-// entries are {base:u32, len:u32} = 8 bytes each.
+// entries are {base:u32, len:u32} = 8 bytes each, matching struct iovec.
 static stack_value bjvm_do_read0(vm_thread *thread, s32 fd, u64 address, s32 count) {
-  __wasi_iovec_t iov = {.buf = (u8 *)(uintptr_t)address, .buf_len = (u32)count};
-  __wasi_size_t nread = 0;
-  __wasi_errno_t e = __wasi_fd_read(fd, &iov, 1, &nread);
-  if (e == __WASI_ERRNO_AGAIN)
+  struct iovec iov = {.iov_base = (void *)(uintptr_t)address, .iov_len = (size_t)count};
+  ssize_t n = readv(fd, &iov, 1);
+  if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
     return (stack_value){.i = BJVM_IOS_UNAVAILABLE};
-  if (e == __WASI_ERRNO_BADF || e == __WASI_ERRNO_NOTSOCK || e == __WASI_ERRNO_INVAL) {
-    bjvm_throw_io(thread, e, "read");
+  if (n < 0 && (errno == EBADF || errno == ENOTSOCK || errno == EINVAL)) {
+    bjvm_throw_io(thread, errno, "read");
     return value_null();
   }
-  if (e) {
+  if (n < 0) {
     // EOF and pipe-close surface as zero-length reads or specific
     // errnos depending on backend; treat leftovers as EOF.
     return (stack_value){.i = BJVM_IOS_EOF};
   }
-  return (stack_value){.i = nread ? (s32)nread : BJVM_IOS_EOF};
+  return (stack_value){.i = n ? (s32)n : BJVM_IOS_EOF};
+}
+
+// Decode the wasm32 struct iovec[] at `address` (entries come from the
+// JDK's IOVec wrapper and are {base:u32, len:u32} = 8 bytes each).
+static inline void bjvm_decode_iovs(struct iovec *iovs, u64 address, u32 n) {
+  const u8 *native_iovs = (const u8 *)(uintptr_t)address;
+  for (u32 i = 0; i < n; ++i) {
+    u32 base = *(const u32 *)(native_iovs + i * 8);
+    u32 len = *(const u32 *)(native_iovs + i * 8 + 4);
+    iovs[i] = (struct iovec){.iov_base = (void *)(uintptr_t)base, .iov_len = len};
+  }
 }
 
 static stack_value bjvm_do_readv0(vm_thread *thread, s32 fd, u64 address, s32 count) {
   if (count <= 0 || count > 1024)
     return (stack_value){.l = BJVM_IOS_UNSUPPORTED};
-  __wasi_iovec_t iovs[64];
+  struct iovec iovs[64];
   u32 n = count > 64 ? 64 : (u32)count;
-  const u8 *native_iovs = (const u8 *)(uintptr_t)address;
-  for (u32 i = 0; i < n; ++i) {
-    u32 base = *(const u32 *)(native_iovs + i * 8);
-    u32 len = *(const u32 *)(native_iovs + i * 8 + 4);
-    iovs[i] = (__wasi_iovec_t){.buf = (u8 *)(uintptr_t)base, .buf_len = len};
-  }
-  __wasi_size_t nread = 0;
-  __wasi_errno_t e = __wasi_fd_read(fd, iovs, n, &nread);
-  if (e == __WASI_ERRNO_AGAIN)
+  bjvm_decode_iovs(iovs, address, n);
+  ssize_t nread = readv(fd, iovs, (int)n);
+  if (nread < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
     return (stack_value){.l = BJVM_IOS_UNAVAILABLE};
-  if (e)
+  if (nread < 0)
     return (stack_value){.l = BJVM_IOS_EOF};
   return (stack_value){.l = nread ? (s64)nread : BJVM_IOS_EOF};
 }
 
 static stack_value bjvm_do_write0(vm_thread *thread, s32 fd, u64 address, s32 count) {
-  __wasi_ciovec_t iov = {.buf = (const u8 *)(uintptr_t)address, .buf_len = (u32)count};
-  __wasi_size_t nwritten = 0;
-  __wasi_errno_t e = __wasi_fd_write(fd, &iov, 1, &nwritten);
-  if (e == __WASI_ERRNO_AGAIN)
+  struct iovec iov = {.iov_base = (void *)(uintptr_t)address, .iov_len = (size_t)count};
+  ssize_t n = writev(fd, &iov, 1);
+  if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
     return (stack_value){.i = BJVM_IOS_UNAVAILABLE};
-  if (e) {
-    bjvm_throw_io(thread, e, "write");
+  if (n < 0) {
+    bjvm_throw_io(thread, errno, "write");
     return value_null();
   }
-  return (stack_value){.i = (s32)nwritten};
+  return (stack_value){.i = (s32)n};
 }
 
 static stack_value bjvm_do_writev0(vm_thread *thread, s32 fd, u64 address, s32 count) {
   if (count <= 0 || count > 1024)
     return (stack_value){.l = BJVM_IOS_UNSUPPORTED};
-  __wasi_ciovec_t iovs[64];
+  struct iovec iovs[64];
   u32 n = count > 64 ? 64 : (u32)count;
-  const u8 *native_iovs = (const u8 *)(uintptr_t)address;
-  for (u32 i = 0; i < n; ++i) {
-    u32 base = *(const u32 *)(native_iovs + i * 8);
-    u32 len = *(const u32 *)(native_iovs + i * 8 + 4);
-    iovs[i] = (__wasi_ciovec_t){.buf = (const u8 *)(uintptr_t)base, .buf_len = len};
-  }
-  __wasi_size_t nwritten = 0;
-  __wasi_errno_t e = __wasi_fd_write(fd, iovs, n, &nwritten);
-  if (e == __WASI_ERRNO_AGAIN)
+  bjvm_decode_iovs(iovs, address, n);
+  ssize_t nwritten = writev(fd, iovs, (int)n);
+  if (nwritten < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
     return (stack_value){.l = BJVM_IOS_UNAVAILABLE};
-  if (e) {
-    bjvm_throw_io(thread, e, "writev");
+  if (nwritten < 0) {
+    bjvm_throw_io(thread, errno, "writev");
     return (stack_value){.l = BJVM_IOS_THROWN};
   }
   return (stack_value){.l = (s64)nwritten};
 }
 
-
-// {buf, bufLen} pair the extension ABI takes its address-of-pointer to.
+// {buf, bufLen} pair holding 4 raw IPv4 bytes (or 16 IPv6), the same
+// shape the old socket ABI took.
 typedef struct {
   const void *buf;
   u32 buf_len;
 } bjvm_addrbuf;
 
 // `addr_int` is the holder().address packed int, which is big-endian as a
-// value; the ABI wants the octets in network order.
-static inline __wasi_errno_t bjvm_bind4(int fd, u32 addr_int, u32 port) {
+// value; sockaddr_in wants the octets in network order.
+static inline int bjvm_bind4(int fd, u32 addr_int, u32 port) {
+  struct sockaddr_in sa = {
+      .sin_family = AF_INET,
+      .sin_port = htons((u16)port),
+  };
   u32 be = __builtin_bswap32(addr_int);
-  bjvm_addrbuf ab = {&be, 4};
-  return bjvm_sock_bind(fd, &ab, port);
+  memcpy(&sa.sin_addr, &be, 4);
+  return bind(fd, (struct sockaddr *)&sa, sizeof sa) == 0 ? 0 : errno;
 }
 
-static inline __wasi_errno_t bjvm_connect4(int fd, u32 addr_int, u32 port) {
+static inline int bjvm_connect4(int fd, u32 addr_int, u32 port) {
+  struct sockaddr_in sa = {
+      .sin_family = AF_INET,
+      .sin_port = htons((u16)port),
+  };
   u32 be = __builtin_bswap32(addr_int);
-  bjvm_addrbuf ab = {&be, 4};
-  return bjvm_sock_connect(fd, &ab, port);
+  memcpy(&sa.sin_addr, &be, 4);
+  return connect(fd, (struct sockaddr *)&sa, sizeof sa) == 0 ? 0 : errno;
 }
 
 typedef struct {
@@ -256,59 +243,45 @@ typedef struct {
   u32 port;
 } bjvm_sockaddr;
 
-static inline __wasi_errno_t bjvm_getaddr(bool peer, int fd, bjvm_sockaddr *out) {
-  u8 sockaddr_any[128];
-  bjvm_addrbuf ab = {sockaddr_any, 128};
-  u32 port = 0;
-  __wasi_errno_t e = peer ? bjvm_sock_getpeeraddr(fd, &ab, &port) : bjvm_sock_getlocaladdr(fd, &ab, &port);
-  if (e)
-    return e;
-  u16 family = *(u16 *)sockaddr_any;
-  out->is_v4 = family != 2;
-  memcpy(out->addr, sockaddr_any + 2, out->is_v4 ? 4 : 16);
-  out->port = port;
+static inline int bjvm_getaddr(bool peer, int fd, bjvm_sockaddr *out) {
+  struct sockaddr_storage sa;
+  socklen_t len = sizeof sa;
+  int r = peer ? getpeername(fd, (struct sockaddr *)&sa, &len) : getsockname(fd, (struct sockaddr *)&sa, &len);
+  if (r < 0)
+    return errno;
+  out->is_v4 = sa.ss_family != AF_INET6;
+  if (out->is_v4) {
+    const struct sockaddr_in *in = (const struct sockaddr_in *)&sa;
+    memcpy(out->addr, &in->sin_addr, 4);
+    out->port = ntohs(in->sin_port);
+  } else {
+    const struct sockaddr_in6 *in6 = (const struct sockaddr_in6 *)&sa;
+    memcpy(out->addr, &in6->sin6_addr, 16);
+    out->port = ntohs(in6->sin6_port);
+  }
   return 0;
 }
 
-// Nonblocking readiness check on a real fd via poll_oneoff plus a
-// zero-timeout clock subscription. Returns ready bits (1=read, 2=write)
-// or -(errno).
+// Nonblocking readiness check on a real fd. Returns ready bits
+// (1=read, 2=write, 4=error) or -(errno).
 static inline int bjvm_fd_poll_once(int fd, bool want_read, bool want_write) {
-  __wasi_subscription_t subs[3];
-  __wasi_event_t out[3];
-  memset(subs, 0, sizeof subs);
-  u32 n = 0;
-  if (want_read) {
-    subs[n].userdata = n;
-    subs[n].u.tag = __WASI_EVENTTYPE_FD_READ;
-    subs[n].u.u.fd_read.file_descriptor = fd;
-    n++;
-  }
-  if (want_write) {
-    subs[n].userdata = n;
-    subs[n].u.tag = __WASI_EVENTTYPE_FD_WRITE;
-    subs[n].u.u.fd_write.file_descriptor = fd;
-    n++;
-  }
-  subs[n].userdata = n;
-  subs[n].u.tag = __WASI_EVENTTYPE_CLOCK;
-  subs[n].u.u.clock.id = __WASI_CLOCKID_MONOTONIC;
-  subs[n].u.u.clock.timeout = 0;
-  subs[n].u.u.clock.precision = 0;
-  subs[n].u.u.clock.flags = 0;
-  n++;
-
-  __wasi_size_t nevents = 0;
-  __wasi_errno_t e = __wasi_poll_oneoff(subs, out, n, &nevents);
-  if (e)
-    return -(int)e;
+  struct pollfd pfd = {.fd = fd, .events = 0, .revents = 0};
+  if (want_read)
+    pfd.events |= POLLIN;
+  if (want_write)
+    pfd.events |= POLLOUT;
+  int r = poll(&pfd, 1, 0);
+  if (r < 0)
+    return -errno;
+  if (r == 0)
+    return 0;
   int ready = 0;
-  for (u32 i = 0; i < nevents; ++i) {
-    if (out[i].type == __WASI_EVENTTYPE_FD_READ)
-      ready |= out[i].error ? 4 : 1;
-    else if (out[i].type == __WASI_EVENTTYPE_FD_WRITE)
-      ready |= 2;
-  }
+  if (pfd.revents & (POLLIN | POLLRDNORM | POLLRDBAND | POLLPRI))
+    ready |= 1;
+  if (pfd.revents & POLLOUT)
+    ready |= 2;
+  if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))
+    ready |= 4;
   return ready;
 }
 

@@ -12,14 +12,16 @@ include(CTest)
 include(AsanSupport)
 include(LtoSupport)
 include(PostprocessWasm)
-include(WasiSupport)
+include(LinuxMuslSupport)
 
-if (CMAKE_SYSTEM_NAME STREQUAL "WASI")
-    set(BJVM_WASI TRUE)
-    configure_wasi_build()
+# BrowserOS's musl libc target. The toolchain file sets CMAKE_SYSTEM_NAME=Linux and
+# CMAKE_SYSTEM_PROCESSOR=wasm32; "Linux on wasm32" is exactly the BrowserOS kernel ABI.
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR STREQUAL "wasm32")
+    set(BJVM_LINUX_MUSL TRUE)
+    configure_linux_musl_build()
 endif ()
 
-if(NOT EMSCRIPTEN)
+if(NOT EMSCRIPTEN AND NOT BJVM_LINUX_MUSL)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 endif()
 set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
@@ -29,7 +31,7 @@ add_subdirectory(vm)
 add_subdirectory(natives)
 
 # gen_natives is a build-time tool, so there is no point cross-compiling it to wasm.
-if (NOT BJVM_WASI)
+if (NOT BJVM_LINUX_MUSL)
     add_subdirectory(codegen)
 endif ()
 
@@ -43,15 +45,18 @@ add_library(bjvm_static STATIC)
 # This keeps names fixed for the post-processor
 target_link_libraries(bjvm_static PUBLIC vm PRIVATE natives)
 
-if (NOT EMSCRIPTEN AND NOT BJVM_WASI)
+if (NOT EMSCRIPTEN AND NOT BJVM_LINUX_MUSL)
     add_library(bjvm SHARED)
     target_link_libraries(bjvm PUBLIC vm PRIVATE natives)
 endif()
 
-if (BJVM_WASI)
-    add_executable(bjvm_wasi vm/bin/main.c vm/wasi_pthread_stub.c)
-    target_link_libraries(bjvm_wasi PRIVATE bjvm_static)
-    configure_wasi_reactor(bjvm_wasi)
+if (BJVM_LINUX_MUSL)
+    # musl's libc.a already provides weak pthread_create/pthread_join for the non-threads
+    # variant (profiler.c references them but is compiled out unless PROFILE_STARTUP),
+    # so the old wasi_pthread_stub.c is no longer needed.
+    add_executable(bjvm_wasm vm/bin/main.c)
+    target_link_libraries(bjvm_wasm PRIVATE bjvm_static)
+    configure_linux_musl_reactor(bjvm_wasm)
 endif ()
 
 if (EMSCRIPTEN)

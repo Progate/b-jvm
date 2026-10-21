@@ -126,8 +126,7 @@ DECLARE_NATIVE("jdk/internal/util", SystemProps_Raw, vmProperties, "()[Ljava/lan
 
   SET_PROP(0, "java.home");
   INIT_STACK_STRING(java_home, 1024);
-#ifdef __wasi__
-  // WASI 版は起動時に PWD へ chdir する（→ vm/bin/main.c）ので、cwd からは決めない。
+#if defined(__wasm__) && !defined(EMSCRIPTEN)
   // browser-java は JDK を必ず /jdk に置く（→ src/mount-paths.ts の JAVA_HOME）。
   // 版を名に入れないのは、JDK を上げるたびに wasm を作り直す羽目になるからである
   java_home = bprintf(java_home, "/jdk");

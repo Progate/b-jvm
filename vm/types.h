@@ -3,7 +3,8 @@
 
 #include <stdint.h>
 
-// True whenever we are targeting WebAssembly, regardless of the toolchain (Emscripten or wasi-sdk).
+// True whenever we are targeting WebAssembly, regardless of the toolchain (Emscripten or the
+// wasm32 musl toolchain that produces the BrowserOS reactor).
 // Use this -- not EMSCRIPTEN -- for anything that is about the *target* rather than about the Emscripten
 // runtime: instruction selection, the absence of inline asm, tail calls not being profitable, and so on.
 // EMSCRIPTEN stays reserved for things that need the Emscripten JS glue (EM_ASM, WASMFS, emscripten_*).

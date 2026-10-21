@@ -25,7 +25,7 @@ typedef struct vm_thread vm_thread;
 typedef struct obj_header obj_header;
 
 #ifndef EMSCRIPTEN_KEEPALIVE
-#ifdef __wasi__
+#if defined(__wasm__) && !defined(EMSCRIPTEN)
 // The reactor module is linked with --export-dynamic, so keeping the symbol alive with default
 // visibility is what makes it a wasm export the host can call.
 #define EMSCRIPTEN_KEEPALIVE __attribute__((used, visibility("default")))

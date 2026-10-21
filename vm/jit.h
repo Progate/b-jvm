@@ -1,4 +1,4 @@
-// A baseline JIT that compiles hot methods to wasm functions (wasm32-wasi only). See jit.c.
+// A baseline JIT that compiles hot methods to wasm functions (wasm reactors only). See jit.c.
 #pragma once
 
 #include "bjvm.h"

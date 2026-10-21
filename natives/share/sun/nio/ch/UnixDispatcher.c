@@ -9,7 +9,7 @@ DECLARE_NATIVE("sun/nio/ch", UnixDispatcher, close0, "(Ljava/io/FileDescriptor;)
     return value_null();
   }
   if (fd >= 0)
-    (void)__wasi_fd_close(fd);
+    (void)close(fd);
   return value_null();
 }
 

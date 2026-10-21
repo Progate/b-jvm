@@ -34,19 +34,20 @@ DECLARE_NATIVE("sun/nio/ch", Net, socket0, "(ZZZZ)I") {
     raise_vm_exception(thread, STR("java/net/SocketException"), STR("IPv6 not supported"));
     return value_null();
   }
-  __wasi_fd_t fd = (__wasi_fd_t)-1;
-  __wasi_errno_t e = bjvm_sock_open(1 /* AF_INET */, args[1].i ? 2 /* SOCK_STREAM */ : 1 /* SOCK_DGRAM */, &fd);
-  if (e) {
-    bjvm_throw_sock(thread, e, "socket");
+  // O_NONBLOCK forever: "blocking" Java I/O is the yield loop, never a blocking syscall
+  // (→ bjvm_fd_set_nonblock).
+  int fd = socket(AF_INET, (args[1].i ? SOCK_STREAM : SOCK_DGRAM) | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+  if (fd < 0) {
+    bjvm_throw_sock(thread, errno, "socket");
     return value_null();
   }
-  return (stack_value){.i = (s32)fd};
+  return (stack_value){.i = fd};
 }
 
 DECLARE_NATIVE("sun/nio/ch", Net, bind0, "(Ljava/io/FileDescriptor;ZZLjava/net/InetAddress;I)V") {
   s32 fd = bjvm_fd_val(args[0].handle->obj);
   u32 addr = bjvm_inet_addr_int(args[3].handle->obj);
-  __wasi_errno_t e = bjvm_bind4(fd, addr, (u32)args[4].i);
+  int e = bjvm_bind4(fd, addr, (u32)args[4].i);
   if (e)
     bjvm_throw_io(thread, e, "bind");
   return value_null();
@@ -54,9 +55,8 @@ DECLARE_NATIVE("sun/nio/ch", Net, bind0, "(Ljava/io/FileDescriptor;ZZLjava/net/I
 
 DECLARE_NATIVE("sun/nio/ch", Net, listen, "(Ljava/io/FileDescriptor;I)V") {
   s32 fd = bjvm_fd_val(args[0].handle->obj);
-  __wasi_errno_t e = bjvm_sock_listen(fd, (u32)args[1].i);
-  if (e)
-    bjvm_throw_io(thread, e, "listen");
+  if (listen(fd, args[1].i) < 0)
+    bjvm_throw_io(thread, errno, "listen");
   return value_null();
 }
 
@@ -64,9 +64,14 @@ DECLARE_ASYNC_NATIVE("sun/nio/ch", Net, connect0, "(ZLjava/io/FileDescriptor;Lja
                      locals(rr_wakeup_info wakeup_info), invoked_methods()) {
   s32 fd = bjvm_fd_val(args[1].handle->obj);
   u32 addr = bjvm_inet_addr_int(args[2].handle->obj);
-  __wasi_errno_t e = bjvm_connect4(fd, addr, (u32)args[3].i);
-  // The loopback table resolves connect immediately: a listener being
-  // there or not decides the result on the first call.
+  int e = bjvm_connect4(fd, addr, (u32)args[3].i);
+  if (e == EINPROGRESS) {
+    // A nonblocking connect reports EINPROGRESS; on the kernel's loopback table the
+    // outcome is decided immediately, so SO_ERROR already knows it.
+    int soerr = 0;
+    socklen_t len = sizeof soerr;
+    e = (getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &len) == 0) ? soerr : errno;
+  }
   if (e) {
     bjvm_throw_sock(thread, e, "connect");
     ASYNC_RETURN(value_null());
@@ -81,8 +86,10 @@ DECLARE_ASYNC_NATIVE("sun/nio/ch", Net, accept,
     // Locals are recomputed each iteration: after ASYNC_YIELD resumes,
     // control re-enters at the yield point and pre-loop locals are gone.
     s32 fd = bjvm_fd_val(args[0].handle->obj);
-    __wasi_fd_t newfd = (__wasi_fd_t)-1;
-    __wasi_errno_t e = __wasi_sock_accept(fd, __WASI_FDFLAGS_NONBLOCK, &newfd);
+    // SOCK_NONBLOCK on the new fd too; the listening fd itself is already O_NONBLOCK
+    // (→ socket0), so a listening queue with nothing pending answers EAGAIN.
+    int newfd = accept4(fd, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
+    int e = newfd < 0 ? errno : 0;
     if (e == 0) {
       obj_header *nfd_obj = args[1].handle->obj;
       if (nfd_obj)
@@ -104,7 +111,7 @@ DECLARE_ASYNC_NATIVE("sun/nio/ch", Net, accept,
       }
       ASYNC_RETURN((stack_value){.i = 1});
     }
-    if (e != __WASI_ERRNO_AGAIN) {
+    if (e != EAGAIN && e != EWOULDBLOCK) {
       bjvm_throw_io(thread, e, "accept");
       ASYNC_RETURN(value_null());
     }
@@ -124,16 +131,9 @@ DECLARE_ASYNC_NATIVE("sun/nio/ch", Net, accept,
 DECLARE_NATIVE("sun/nio/ch", Net, shutdown, "(Ljava/io/FileDescriptor;I)V") {
   s32 fd = bjvm_fd_val(args[0].handle->obj);
   int how = args[1].i; // JDK encodes: 0 read, 1 write (see Net.java)
-  // WASI sdflags: 1 = RD, 2 = WR
-  __wasi_sdflags_t flags = 0;
-  if (how == 0)
-    flags = __WASI_SDFLAGS_RD;
-  else if (how == 1)
-    flags = __WASI_SDFLAGS_WR;
-  else if (how == 2)
-    flags = __WASI_SDFLAGS_RD | __WASI_SDFLAGS_WR;
-  if (flags)
-    (void)__wasi_sock_shutdown(fd, flags);
+  int posix_how = how == 0 ? SHUT_RD : how == 1 ? SHUT_WR : how == 2 ? SHUT_RDWR : -1;
+  if (posix_how >= 0)
+    (void)shutdown(fd, posix_how);
   return value_null();
 }
 
@@ -172,9 +172,9 @@ DECLARE_NATIVE("sun/nio/ch", Net, remoteInetAddress, "(Ljava/io/FileDescriptor;)
 DECLARE_NATIVE("sun/nio/ch", Net, getIntOption0, "(Ljava/io/FileDescriptor;ZII)I") {
   s32 fd = bjvm_fd_val(args[0].handle->obj);
   u32 val = 0;
-  u32 len = sizeof val;
-  __wasi_errno_t e = bjvm_sock_getsockopt(fd, (u32)args[2].i, (u32)args[3].i, &val, len);
-  if (e)
+  socklen_t len = sizeof val;
+  // level/opt are the JDK's SocketOptionRegistry values, which are the platform's real constants
+  if (getsockopt(fd, args[2].i, args[3].i, &val, &len) < 0)
     return (stack_value){.i = 0}; // unknown option -> default 0
   return (stack_value){.i = (s32)val};
 }
@@ -182,7 +182,7 @@ DECLARE_NATIVE("sun/nio/ch", Net, getIntOption0, "(Ljava/io/FileDescriptor;ZII)I
 DECLARE_NATIVE("sun/nio/ch", Net, setIntOption0, "(Ljava/io/FileDescriptor;ZIIIZ)V") {
   s32 fd = bjvm_fd_val(args[0].handle->obj);
   u32 val = (u32)args[4].i;
-  (void)bjvm_sock_setsockopt(fd, (u32)args[2].i, (u32)args[3].i, &val, sizeof val);
+  (void)setsockopt(fd, args[2].i, args[3].i, &val, sizeof val);
   return value_null();
 }
 
@@ -199,7 +199,7 @@ DECLARE_ASYNC_NATIVE("sun/nio/ch", Net, poll, "(Ljava/io/FileDescriptor;IJ)I",
 
     int ready = bjvm_fd_poll_once(fd, !!(events & 1), !!(events & 4));
     if (ready < 0) {
-      bjvm_throw_io(thread, (__wasi_errno_t)-ready, "poll");
+      bjvm_throw_io(thread, -ready, "poll");
       ASYNC_RETURN(value_null());
     }
     if (ready)

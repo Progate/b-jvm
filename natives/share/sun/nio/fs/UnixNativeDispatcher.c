@@ -1,52 +1,19 @@
 
 #include <natives-dsl.h>
-#ifdef EMSCRIPTEN
-#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
-#else
-#include <sys/errno.h>
-#include <sys/fcntl.h>
 #include <sys/types.h>
 #define _POSIX_C_SOURCE 200809L
 #include <dirent.h>
-#endif
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
-#ifdef __wasi__
 // UnixException.translateToIOException は errno を同梱 JDK の UnixConstants（Linux で生成）と
-// 比べて NoSuchFileException などを選ぶ。wasi-libc の errno は番号が違う（ENOENT が 44）ので、
-// そのままだとどれにも当たらず素の FileSystemException になり、NoSuchFileException を
-// 受け止めるつもりのコード（IntelliJ の Registry が読む early-access-registry.txt）が落ちる。
-// 表にあるのは UnixConstants にあるものだけで、それ以外は strerror のためにそのまま通す
-static const struct {
-  int wasi;
-  int linux;
-} errno_to_linux[] = {
-    {ENOENT, 2},     {ENXIO, 6},   {EACCES, 13},  {EEXIST, 17},  {ENOTDIR, 20}, {EINVAL, 22},
-    {EXDEV, 18},     {EISDIR, 21}, {ENOTEMPTY, 39}, {ENOSPC, 28}, {EAGAIN, 11},  {ENOSYS, 38},
-    {ELOOP, 40},     {EROFS, 30},  {ERANGE, 34},  {EMFILE, 24},
-};
-
-static int to_linux_errno(int code) {
-  for (size_t i = 0; i < sizeof(errno_to_linux) / sizeof(errno_to_linux[0]); ++i)
-    if (errno_to_linux[i].wasi == code)
-      return errno_to_linux[i].linux;
-  return code;
-}
-
-static int from_linux_errno(int code) {
-  for (size_t i = 0; i < sizeof(errno_to_linux) / sizeof(errno_to_linux[0]); ++i)
-    if (errno_to_linux[i].linux == code)
-      return errno_to_linux[i].wasi;
-  return code;
-}
-#else
+// 比べて NoSuchFileException などを選ぶ。musl の errno は Linux の値そのものなので変換は要らない
 static int to_linux_errno(int code) { return code; }
 static int from_linux_errno(int code) { return code; }
-#endif
 
 static obj_header *create_unix_exception_from_linux(vm_thread *thread, int errno_code);
 
@@ -185,56 +152,9 @@ DECLARE_NATIVE("sun/nio/fs", UnixNativeDispatcher, closedir, "(J)V") {
   return value_null();
 }
 
-#ifdef __wasi__
-// sun/nio/fs/UnixConstants in the bundled JDK was generated on Linux, so the oflags that reach open0
-// are Linux's. wasi-libc encodes them completely differently -- O_RDONLY is 0x04000000 there, not 0 --
-// so passing them through unchanged makes every open() fail with EINVAL. Notably that includes
-// lib/modules, which is how the boot layer fails to initialize.
-enum {
-  LINUX_O_ACCMODE = 03,
-  LINUX_O_WRONLY = 01,
-  LINUX_O_RDWR = 02,
-  LINUX_O_CREAT = 0100,
-  LINUX_O_EXCL = 0200,
-  LINUX_O_TRUNC = 01000,
-  LINUX_O_APPEND = 02000,
-  LINUX_O_NONBLOCK = 04000,
-  LINUX_O_DSYNC = 010000,
-  LINUX_O_DIRECTORY = 0200000,
-  LINUX_O_NOFOLLOW = 0400000,
-  LINUX_O_SYNC = 04010000,
-};
-
-static int translate_oflags(int linux_flags) {
-  int accmode = linux_flags & LINUX_O_ACCMODE;
-  int flags = accmode == LINUX_O_WRONLY ? O_WRONLY : accmode == LINUX_O_RDWR ? O_RDWR : O_RDONLY;
-
-  // O_SYNC contains the O_DSYNC bit on Linux, so it has to be tested as a whole first.
-  if ((linux_flags & LINUX_O_SYNC) == LINUX_O_SYNC)
-    flags |= O_SYNC;
-  else if (linux_flags & LINUX_O_DSYNC)
-    flags |= O_DSYNC;
-
-  if (linux_flags & LINUX_O_CREAT)
-    flags |= O_CREAT;
-  if (linux_flags & LINUX_O_EXCL)
-    flags |= O_EXCL;
-  if (linux_flags & LINUX_O_TRUNC)
-    flags |= O_TRUNC;
-  if (linux_flags & LINUX_O_APPEND)
-    flags |= O_APPEND;
-  if (linux_flags & LINUX_O_NONBLOCK)
-    flags |= O_NONBLOCK;
-  if (linux_flags & LINUX_O_DIRECTORY)
-    flags |= O_DIRECTORY;
-  if (linux_flags & LINUX_O_NOFOLLOW)
-    flags |= O_NOFOLLOW;
-
-  return flags;
-}
-#else
+// sun/nio/fs/UnixConstants in the bundled JDK was generated on Linux, and musl's O_* are
+// Linux's values verbatim, so open0's flags pass through unchanged.
 static int translate_oflags(int flags) { return flags; }
-#endif
 
 DECLARE_NATIVE("sun/nio/fs", UnixNativeDispatcher, open0, "(JII)I") {
   int result = open((char const *)args[0].l, translate_oflags(args[1].i), args[2].i);
@@ -295,15 +215,8 @@ DECLARE_NATIVE("sun/nio/ch", UnixFileDispatcherImpl, size0, "(Ljava/io/FileDescr
 }
 
 DECLARE_NATIVE("sun/nio/ch", UnixFileDispatcherImpl, allocationGranularity0, "()J") {
-#ifdef __wasi__
-  // wasi-libc emulates mmap with malloc, so mappings are only malloc-aligned. FileChannelImpl asserts
-  // that the address map0 returns is a multiple of this granularity, and it also uses it to round map
-  // offsets down. Reporting 1 tells the truth about an allocator-backed mapping: there are no pages to
-  // align to. Reporting 4096 would make the JDK assert on the very first mapping (lib/modules).
-  return (stack_value){.l = 1};
-#else
+  // BrowserOS's mmap(2) hands out page-granular mappings
   return (stack_value){.l = 4096};
-#endif
 }
 
 // (fd: FileDescriptor, prot:Int, pos: Long, len: Long, isSync: Boolean) -> Long
@@ -426,22 +339,19 @@ DECLARE_NATIVE("sun/nio/ch", UnixFileDispatcherImpl, close0, "(Ljava/io/FileDesc
 
 // 実機（OpenJDK の UnixFileDispatcherImpl.c）と同じ規則にする。chr/fifo/sock は
 // FIONREAD で滞留バイト数、通常ファイルは size - position、どちらも取れなければ 0。
-// WASI に FIONREAD 相当は無いので、非シーク可能な fd は lseek が失敗して 0 に落ちる
+// カーネルが FIONREAD を持たない fd は ioctl が失敗して lseek の分岐へ落ちる
 DECLARE_NATIVE("sun/nio/ch", UnixFileDispatcherImpl, available0, "(Ljava/io/FileDescriptor;)I") {
   int fd = unwrap_fd(args[0].handle->obj);
   struct stat fbuf;
   s64 size = -1;
 
   if (fstat(fd, &fbuf) != -1) {
-#ifndef __wasi__
     int mode = fbuf.st_mode;
     if (S_ISCHR(mode) || S_ISFIFO(mode) || S_ISSOCK(mode)) {
       int n = 0;
       if (ioctl(fd, FIONREAD, &n) >= 0)
         return (stack_value){.i = n};
-    } else
-#endif
-    if (S_ISREG(fbuf.st_mode)) {
+    } else if (S_ISREG(fbuf.st_mode)) {
       size = fbuf.st_size;
     }
   }
@@ -496,7 +406,7 @@ DECLARE_NATIVE("sun/nio/ch", FileDispatcherImpl, init0, "()V") { return value_nu
     return value_null();                                                                                               \
   } while (0)
 
-// UnixConstants（Linux）の AT_* を wasi-libc の値へ
+// UnixConstants（Linux）の AT_* をホスト libc の値へ（musl では同じ値だが、名で読むほうが分かりやすい）
 static int translate_at_flags(int linux_flags) {
   int flags = 0;
   if (linux_flags & 0x100)
@@ -514,8 +424,9 @@ static stack_value byte_array_of(vm_thread *thread, const char *chars, size_t le
   return (stack_value){.obj = array};
 }
 
-// WASI には fd を複製する仕組みが無い。init が openat 系の能力を申告しないので、JDK の
-// SecureDirectoryStream（ここを呼ぶ）は選ばれない
+// init が openat 系の能力を申告しないので、JDK の SecureDirectoryStream（ここを呼ぶ）は
+// 選ばれない。カーネルの Linux syscall 表に dup/dup3 も無い（-ENOSYS）ので、申告し始めたら
+// 実装が要る
 DECLARE_NATIVE("sun/nio/fs", UnixNativeDispatcher, dup, "(I)I") {
   errno = ENOTSUP;
   THROW_ERRNO();
@@ -626,7 +537,8 @@ DECLARE_NATIVE("sun/nio/fs", UnixNativeDispatcher, getlinelen, "(J)I") {
   return (stack_value){.i = -1};
 }
 
-// WASI には所有者も権限ビットも無い。chmod / chown は「変えた」ことにし、時刻だけは本当に変える
+// BrowserOS の FS は権限ビットを持たず fchmod は -ENOSYS で返る。chmod / chown は「変えた」
+// ことにし、時刻だけは本当に変える（fchown/fchownat はカーネル側で「変えてよいか」の判定をする）
 DECLARE_NATIVE("sun/nio/fs", UnixNativeDispatcher, chmod0, "(JI)V") { return value_null(); }
 DECLARE_NATIVE("sun/nio/fs", UnixNativeDispatcher, fchmod0, "(II)V") { return value_null(); }
 DECLARE_NATIVE("sun/nio/fs", UnixNativeDispatcher, chown0, "(JII)V") { return value_null(); }

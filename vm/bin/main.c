@@ -20,14 +20,8 @@
 
 EMSCRIPTEN_KEEPALIVE
 vm *ffi_create_vm(const char *classpath, size_t heap_size, write_bytes stdout_, write_bytes stderr_) {
-#ifdef __wasi__
-  // WASI preview1 に chdir の syscall は無く、cwd は wasi-libc が持つ。BrowserOS はシェルの cwd を
-  // PWD で渡すので、起動時にそこへ移る（→ browser-os の src/wasi/imports.ts）。移らないと Java の
-  // 相対パス（`new File("main.kt")`、kotlinc の引数）がすべて `/` 基準になる
-  const char *pwd = getenv("PWD");
-  if (pwd && *pwd)
-    (void)chdir(pwd);
-#endif
+  // cwd は BrowserOS のカーネルがプロセスごとに持つ（open(2) も相対パスをそこから解く）ので、
+  // ここで chdir する必要は無い
   vm_options options = default_vm_options();
   options.classpath = (slice){.chars = (char *)classpath, .len = (int)strlen(classpath)};
   options.heap_size = heap_size;

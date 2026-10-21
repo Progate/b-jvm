@@ -2,12 +2,11 @@
 
 /*
  * DatagramChannel receive/send/disconnect. The JDK hands receive0 a
- * NativeSocketAddress buffer laid out like a real sockaddr_in(6), but
- * the WASI socket ABI uses its own {family u16, addr bytes @+2} form
- * with the port out-of-band -- so each call transcodes between the two.
+ * NativeSocketAddress buffer laid out like a real sockaddr_in(6) --
+ * which under Linux-musl is exactly what recvmsg fills, so each call
+ * transcodes between the JDK's encoding and a real sockaddr_in.
  *
- * Families: ABI uses 1=ipv4 / 2=ipv6, the JDK sockaddr uses 2=AF_INET /
- * 10=AF_INET6. Datagrams are IPv4-only here (IPv6 fails at socket0).
+ * Datagrams are IPv4-only here (IPv6 fails at socket0).
  */
 
 static bool bjvm_jdk_sockaddr_decode(const u8 *sa, u32 sa_len, bjvm_sockaddr *out) {
@@ -45,14 +44,11 @@ DECLARE_ASYNC_NATIVE("sun/nio/ch", DatagramChannelImpl, receive0, "(Ljava/io/Fil
   for (;;) {
     s32 fd = bjvm_fd_val(args[0].handle->obj);
     bool nonblock = bjvm_fd_is_nonblock(fd);
-    __wasi_iovec_t iov = {.buf = (u8 *)(uintptr_t)(u64)args[1].l, .buf_len = (u32)args[2].i};
-    u8 abi_addr[128];
-    bjvm_addrbuf ab = {abi_addr, 128};
-    u32 port = 0;
-    __wasi_size_t nread = 0;
-    u16 oflags = 0;
-    __wasi_errno_t e = bjvm_sock_recv_from(fd, &iov, 1, &ab, 0, &port, &nread, &oflags);
-    if (e == __WASI_ERRNO_AGAIN) {
+    struct iovec iov = {.iov_base = (void *)(uintptr_t)(u64)args[1].l, .iov_len = (size_t)args[2].i};
+    struct sockaddr_in src = {0};
+    struct msghdr msg = {.msg_name = &src, .msg_namelen = sizeof src, .msg_iov = &iov, .msg_iovlen = 1};
+    ssize_t nread = recvmsg(fd, &msg, 0);
+    if (nread < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
       if (nonblock)
         ASYNC_RETURN((stack_value){.i = BJVM_IOS_UNAVAILABLE});
       self->wakeup_info.kind = RR_WAKEUP_SLEEP;
@@ -60,13 +56,12 @@ DECLARE_ASYNC_NATIVE("sun/nio/ch", DatagramChannelImpl, receive0, "(Ljava/io/Fil
       ASYNC_YIELD((void *)&self->wakeup_info);
       continue;
     }
-    if (e) {
-      bjvm_throw_sock(thread, e, "receive");
+    if (nread < 0) {
+      bjvm_throw_sock(thread, errno, "receive");
       ASYNC_RETURN(value_null());
     }
-    u16 family = *(u16 *)abi_addr;
-    if (family == 1 /* ABI ipv4 */)
-      bjvm_jdk_sockaddr_encode((u8 *)(uintptr_t)(u64)args[3].l, 16, abi_addr + 2, port);
+    if (src.sin_family == AF_INET)
+      bjvm_jdk_sockaddr_encode((u8 *)(uintptr_t)(u64)args[3].l, 16, (const u8 *)&src.sin_addr, ntohs(src.sin_port));
     else
       memset((void *)(uintptr_t)(u64)args[3].l, 0, 28);
     ASYNC_RETURN((stack_value){.i = (s32)nread});
@@ -79,7 +74,7 @@ DECLARE_ASYNC_NATIVE("sun/nio/ch", DatagramChannelImpl, send0, "(Ljava/io/FileDe
   for (;;) {
     s32 fd = bjvm_fd_val(args[0].handle->obj);
     bool nonblock = bjvm_fd_is_nonblock(fd);
-    __wasi_ciovec_t iov = {.buf = (const u8 *)(uintptr_t)(u64)args[1].l, .buf_len = (u32)args[2].i};
+    struct iovec iov = {.iov_base = (void *)(uintptr_t)(u64)args[1].l, .iov_len = (size_t)args[2].i};
     bjvm_sockaddr target = {0};
     if (!bjvm_jdk_sockaddr_decode((const u8 *)(uintptr_t)(u64)args[3].l, (u32)args[4].i, &target)) {
       raise_vm_exception(thread, STR("java/net/SocketException"), STR("unsupported address family"));
@@ -89,10 +84,13 @@ DECLARE_ASYNC_NATIVE("sun/nio/ch", DatagramChannelImpl, send0, "(Ljava/io/FileDe
       raise_vm_exception(thread, STR("java/net/SocketException"), STR("IPv6 not supported"));
       ASYNC_RETURN(value_null());
     }
-    bjvm_addrbuf ab = {target.addr, 4};
-    __wasi_size_t nwritten = 0;
-    __wasi_errno_t e = bjvm_sock_send_to(fd, &iov, 1, &ab, target.port, 0, &nwritten);
-    if (e == __WASI_ERRNO_AGAIN) {
+    struct sockaddr_in dst = {
+        .sin_family = AF_INET,
+        .sin_port = htons((u16)target.port),
+    };
+    memcpy(&dst.sin_addr, target.addr, 4);
+    ssize_t nwritten = sendto(fd, iov.iov_base, iov.iov_len, 0, (struct sockaddr *)&dst, sizeof dst);
+    if (nwritten < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
       if (nonblock)
         ASYNC_RETURN((stack_value){.i = BJVM_IOS_UNAVAILABLE});
       self->wakeup_info.kind = RR_WAKEUP_SLEEP;
@@ -100,8 +98,8 @@ DECLARE_ASYNC_NATIVE("sun/nio/ch", DatagramChannelImpl, send0, "(Ljava/io/FileDe
       ASYNC_YIELD((void *)&self->wakeup_info);
       continue;
     }
-    if (e) {
-      bjvm_throw_sock(thread, e, "send");
+    if (nwritten < 0) {
+      bjvm_throw_sock(thread, errno, "send");
       ASYNC_RETURN(value_null());
     }
     ASYNC_RETURN((stack_value){.i = (s32)nwritten});

@@ -4,9 +4,7 @@
 
 #include "posix-fs.h"
 
-// wasi-libc does not define __unix__, but it does provide stat(2) and the errno values used below,
-// backed by whatever the host wires up to path_filestat_get.
-#if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__)) || defined(__wasi__)
+#if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
 #define POSIX_SUPPORTED
 #endif
 

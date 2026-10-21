@@ -4,7 +4,7 @@
 #include <unistd.h>
 #include <util.h>
 
-#if defined(__APPLE__) || defined(__linux__) || defined(__wasi__)
+#if defined(__APPLE__) || defined(__linux__)
 #include <sys/time.h>
 #define USE_SYS_TIME
 #endif
