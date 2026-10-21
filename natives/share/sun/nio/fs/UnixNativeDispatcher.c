@@ -424,6 +424,55 @@ DECLARE_NATIVE("sun/nio/ch", UnixFileDispatcherImpl, close0, "(Ljava/io/FileDesc
   return value_null();
 }
 
+// 実機（OpenJDK の UnixFileDispatcherImpl.c）と同じ規則にする。chr/fifo/sock は
+// FIONREAD で滞留バイト数、通常ファイルは size - position、どちらも取れなければ 0。
+// WASI に FIONREAD 相当は無いので、非シーク可能な fd は lseek が失敗して 0 に落ちる
+DECLARE_NATIVE("sun/nio/ch", UnixFileDispatcherImpl, available0, "(Ljava/io/FileDescriptor;)I") {
+  int fd = unwrap_fd(args[0].handle->obj);
+  struct stat fbuf;
+  s64 size = -1;
+
+  if (fstat(fd, &fbuf) != -1) {
+#ifndef __wasi__
+    int mode = fbuf.st_mode;
+    if (S_ISCHR(mode) || S_ISFIFO(mode) || S_ISSOCK(mode)) {
+      int n = 0;
+      if (ioctl(fd, FIONREAD, &n) >= 0)
+        return (stack_value){.i = n};
+    } else
+#endif
+    if (S_ISREG(fbuf.st_mode)) {
+      size = fbuf.st_size;
+    }
+  }
+
+  off_t position = lseek(fd, 0, SEEK_CUR);
+  if (position == -1)
+    return (stack_value){.i = 0};
+
+  if (size < position) {
+    // サイズ不明、あるいは開いたあと縮んだ fd では末端を測ってから元の位置に戻す
+    off_t end = lseek(fd, 0, SEEK_END);
+    if (end == -1 || lseek(fd, position, SEEK_SET) == -1)
+      return (stack_value){.i = 0};
+    size = end;
+  }
+
+  s64 available = size - position;
+  return (stack_value){.i = available > INT32_MAX ? INT32_MAX : (s32)available};
+}
+
+DECLARE_NATIVE("sun/nio/ch", UnixFileDispatcherImpl, isOther0, "(Ljava/io/FileDescriptor;)Z") {
+  int fd = unwrap_fd(args[0].handle->obj);
+  struct stat fbuf;
+  if (fstat(fd, &fbuf) == -1) {
+    thread->current_exception = create_unix_exception(thread, errno);
+    return value_null();
+  }
+  int mode = fbuf.st_mode;
+  return (stack_value){.i = (S_ISREG(mode) || S_ISDIR(mode) || S_ISLNK(mode)) ? 0 : 1};
+}
+
 DECLARE_NATIVE("sun/nio/fs", UnixNativeDispatcher, strerror, "(I)[B") {
   char *msg = strerror(from_linux_errno(args[0].i));
   size_t len = strlen(msg);
