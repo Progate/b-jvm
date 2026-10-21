@@ -7,7 +7,26 @@
 // (be it static or nonstatic) to identify it. This works well because we're
 // supposed to use the static memory offset when the object is null.
 
-DECLARE_NATIVE("jdk/internal/misc", Unsafe, registerNatives, "()V") { return value_null(); }
+DECLARE_NATIVE("jdk/internal/misc", Unsafe, registerNatives, "()V") {
+  // JDK 25 の UnsafeConstants は clinit が 0 を書くだけで、HotSpot は registerNatives
+  // 内の UnsafeConstants::initialize 相当処理で実値を書き込む。clinit が後から
+  // 0 を上書きしないよう、初期化を先に済ませてから同じ値を書く。
+  classdesc *uc = bootstrap_lookup_class(thread, STR("jdk/internal/misc/UnsafeConstants"));
+  initialize_class_t init = {.args = {thread, uc}};
+  future_t f = initialize_class(&init);
+  CHECK(f.status == FUTURE_READY);
+  cp_field *address_size = field_lookup(uc, STR("ADDRESS_SIZE0"), STR("I"));
+  cp_field *page_size = field_lookup(uc, STR("PAGE_SIZE"), STR("I"));
+  cp_field *big_endian = field_lookup(uc, STR("BIG_ENDIAN"), STR("Z"));
+  cp_field *unaligned = field_lookup(uc, STR("UNALIGNED_ACCESS"), STR("Z"));
+  cp_field *flush_size = field_lookup(uc, STR("DATA_CACHE_LINE_FLUSH_SIZE"), STR("I"));
+  set_static_field(address_size, (stack_value){.i = sizeof(void *)});
+  set_static_field(page_size, (stack_value){.i = 4096});
+  set_static_field(big_endian, (stack_value){.i = 0});
+  set_static_field(unaligned, (stack_value){.i = 1});
+  set_static_field(flush_size, (stack_value){.i = 0});
+  return value_null();
+}
 
 DECLARE_NATIVE("jdk/internal/misc", Unsafe, arrayBaseOffset0, "(Ljava/lang/Class;)I") {
   return (stack_value){.i = kArrayDataOffset};
@@ -237,7 +256,17 @@ DECLARE_NATIVE("jdk/internal/misc", Unsafe, unpark, "(Ljava/lang/Object;)V") {
   assert(scheduler && "Cannot park thread without a scheduler!");
   struct native_Thread *thr = (struct native_Thread *)args[0].handle->obj;
 
-  [[maybe_unused]] int err = set_unpark_permit((vm_thread *)thr->eetop);
+  // 仮想スレッドには VM スレッドが無いので、mount されていればキャリアを解除対象にする。
+  // 未 mount の VT が park することはない（park はキャリア上の実行中にしか起きない）
+  vm_thread *target = (vm_thread *)(intptr_t)thr->eetop;
+  if (!target) {
+    object carrier = LoadFieldObject(args[0].handle->obj, "java/lang/Thread", "carrierThread");
+    if (carrier) {
+      target = (vm_thread *)(intptr_t)((struct native_Thread *)carrier)->eetop;
+    }
+  }
+
+  [[maybe_unused]] int err = set_unpark_permit(target);
   assert(!err && "Tried to unpark a non-alive thread");
   return value_null();
 }
@@ -321,6 +350,28 @@ DECLARE_NATIVE("jdk/internal/misc", Unsafe, getByte, "(Ljava/lang/Object;J)B") {
   return (stack_value){.i = *(s8 *)((uintptr_t)args[0].handle->obj + args[1].l)};
 }
 
+DECLARE_NATIVE("jdk/internal/misc", Unsafe, getChar, "(Ljava/lang/Object;J)C") {
+  DCHECK(argc == 2);
+  return (stack_value){.i = *(u16 *)((uintptr_t)args[0].handle->obj + args[1].l)};
+}
+
+DECLARE_NATIVE("jdk/internal/misc", Unsafe, putChar, "(Ljava/lang/Object;JC)V") {
+  DCHECK(argc == 3);
+  *(u16 *)((uintptr_t)args[0].handle->obj + args[1].l) = (u16)args[2].i;
+  return value_null();
+}
+
+DECLARE_NATIVE("jdk/internal/misc", Unsafe, getFloat, "(Ljava/lang/Object;J)F") {
+  DCHECK(argc == 2);
+  return (stack_value){.f = *(float *)((uintptr_t)args[0].handle->obj + args[1].l)};
+}
+
+DECLARE_NATIVE("jdk/internal/misc", Unsafe, putFloat, "(Ljava/lang/Object;JF)V") {
+  DCHECK(argc == 3);
+  *(float *)((uintptr_t)args[0].handle->obj + args[1].l) = args[2].f;
+  return value_null();
+}
+
 DECLARE_NATIVE("jdk/internal/misc", Unsafe, getBoolean, "(Ljava/lang/Object;J)Z") {
   DCHECK(argc == 2);
   return (stack_value){.i = (bool)*(u8 *)((uintptr_t)args[0].handle->obj + args[1].l)};
@@ -341,7 +392,139 @@ DECLARE_NATIVE("jdk/internal/misc", Unsafe, getReferenceVolatile, "(Ljava/lang/O
   return (stack_value){.obj = *(void **)((uintptr_t)args[0].handle->obj + args[1].l)};
 }
 
-DECLARE_NATIVE("jdk/internal/misc", Unsafe, defineClass,
+// b-jvm は協調スレッドなので volatile 系はプレーンな load/store で足りる
+DECLARE_NATIVE("jdk/internal/misc", Unsafe, getBooleanVolatile, "(Ljava/lang/Object;J)Z") {
+  DCHECK(argc == 2);
+  return (stack_value){.i = (bool)*(u8 *)((uintptr_t)args[0].handle->obj + args[1].l)};
+}
+
+DECLARE_NATIVE("jdk/internal/misc", Unsafe, putBooleanVolatile, "(Ljava/lang/Object;JZ)V") {
+  DCHECK(argc == 3);
+  *(u8 *)((uintptr_t)args[0].handle->obj + args[1].l) = args[2].i;
+  return value_null();
+}
+
+DECLARE_NATIVE("jdk/internal/misc", Unsafe, getByteVolatile, "(Ljava/lang/Object;J)B") {
+  DCHECK(argc == 2);
+  return (stack_value){.i = *(s8 *)((uintptr_t)args[0].handle->obj + args[1].l)};
+}
+
+DECLARE_NATIVE("jdk/internal/misc", Unsafe, putByteVolatile, "(Ljava/lang/Object;JB)V") {
+  DCHECK(argc == 3);
+  *(s8 *)((uintptr_t)args[0].handle->obj + args[1].l) = args[2].i;
+  return value_null();
+}
+
+DECLARE_NATIVE("jdk/internal/misc", Unsafe, getCharVolatile, "(Ljava/lang/Object;J)C") {
+  DCHECK(argc == 2);
+  return (stack_value){.i = *(u16 *)((uintptr_t)args[0].handle->obj + args[1].l)};
+}
+
+DECLARE_NATIVE("jdk/internal/misc", Unsafe, putCharVolatile, "(Ljava/lang/Object;JC)V") {
+  DCHECK(argc == 3);
+  *(u16 *)((uintptr_t)args[0].handle->obj + args[1].l) = (u16)args[2].i;
+  return value_null();
+}
+
+DECLARE_NATIVE("jdk/internal/misc", Unsafe, getShortVolatile, "(Ljava/lang/Object;J)S") {
+  DCHECK(argc == 2);
+  return (stack_value){.i = *(short *)((uintptr_t)args[0].handle->obj + args[1].l)};
+}
+
+DECLARE_NATIVE("jdk/internal/misc", Unsafe, putShortVolatile, "(Ljava/lang/Object;JS)V") {
+  DCHECK(argc == 3);
+  *(short *)((uintptr_t)args[0].handle->obj + args[1].l) = (short)args[2].i;
+  return value_null();
+}
+
+DECLARE_NATIVE("jdk/internal/misc", Unsafe, getFloatVolatile, "(Ljava/lang/Object;J)F") {
+  DCHECK(argc == 2);
+  return (stack_value){.f = *(float *)((uintptr_t)args[0].handle->obj + args[1].l)};
+}
+
+DECLARE_NATIVE("jdk/internal/misc", Unsafe, putFloatVolatile, "(Ljava/lang/Object;JF)V") {
+  DCHECK(argc == 3);
+  *(float *)((uintptr_t)args[0].handle->obj + args[1].l) = args[2].f;
+  return value_null();
+}
+
+DECLARE_NATIVE("jdk/internal/misc", Unsafe, getDoubleVolatile, "(Ljava/lang/Object;J)D") {
+  DCHECK(argc == 2);
+  return (stack_value){.d = *(double *)((uintptr_t)args[0].handle->obj + args[1].l)};
+}
+
+DECLARE_NATIVE("jdk/internal/misc", Unsafe, putDoubleVolatile, "(Ljava/lang/Object;JD)V") {
+  DCHECK(argc == 3);
+  *(double *)((uintptr_t)args[0].handle->obj + args[1].l) = args[2].d;
+  return value_null();
+}
+
+DECLARE_NATIVE("jdk/internal/misc", Unsafe, compareAndExchangeInt, "(Ljava/lang/Object;JII)I") {
+  DCHECK(argc == 4);
+  obj_header *target = args[0].handle->obj;
+  s64 offset = args[1].l;
+  int expected = args[2].i, update = args[3].i;
+  return (stack_value){.i = __sync_val_compare_and_swap((int *)((uintptr_t)target + offset), expected, update)};
+}
+
+DECLARE_NATIVE("jdk/internal/misc", Unsafe, compareAndExchangeLong, "(Ljava/lang/Object;JJJ)J") {
+  DCHECK(argc == 4);
+  obj_header *target = args[0].handle->obj;
+  s64 offset = args[1].l;
+  s64 expected = args[2].l, update = args[3].l;
+  return (stack_value){.l = __sync_val_compare_and_swap((s64 *)((uintptr_t)target + offset), expected, update)};
+}
+
+// 圧縮ポインタを使わないので、アドレス上の参照をそのまま読む
+DECLARE_NATIVE("jdk/internal/misc", Unsafe, getUncompressedObject, "(J)Ljava/lang/Object;") {
+  DCHECK(argc == 1);
+  return (stack_value){.obj = *(void **)(uintptr_t)args[0].l};
+}
+
+DECLARE_NATIVE("jdk/internal/misc", Unsafe, throwException, "(Ljava/lang/Throwable;)V") {
+  DCHECK(argc == 1);
+  raise_exception_object(thread, args[0].handle->obj);
+  return value_null();
+}
+
+// ロードアベレージを取る基盤が無いので「取得不可」の -1 を返す
+DECLARE_NATIVE("jdk/internal/misc", Unsafe, getLoadAverage0, "([DI)I") { return (stack_value){.i = -1}; }
+
+DECLARE_NATIVE("jdk/internal/misc", Unsafe, reallocateMemory0, "(JJ)J") {
+  DCHECK(argc == 2);
+  void *old = (void *)args[0].l;
+  void *p = realloc(old, (size_t)args[1].l);
+  if (!p)
+    return (stack_value){.l = 0};
+  // realloc で生きたまま移動したときだけ追跡側を差し替える（freeMemory0 の解除経路を壊さないため）
+  if (p != old) {
+    remove_unsafe_allocation(thread->vm, old);
+    arrput(thread->vm->unsafe_allocations, p);
+  }
+  return (stack_value){.l = (s64)p};
+}
+
+// 要素単位でバイト列を反転させながらコピーする（エンディアン変換用）
+DECLARE_NATIVE("jdk/internal/misc", Unsafe, copySwapMemory0, "(Ljava/lang/Object;JLjava/lang/Object;JJJ)V") {
+  DCHECK(argc == 6);
+  u8 *src = (u8 *)args[0].handle->obj + args[1].l;
+  u8 *dst = (u8 *)args[2].handle->obj + args[3].l;
+  u64 bytes = args[4].l, elem = args[5].l;
+  DCHECK(elem > 0 && elem <= 8);
+  for (u64 i = 0; i + elem <= bytes; i += elem) {
+    for (u64 j = 0; j < elem; ++j) {
+      dst[i + j] = src[i + elem - 1 - j];
+    }
+  }
+  return value_null();
+}
+
+// キャッシュラインフラッシュは wasm に存在しないので no-op
+DECLARE_NATIVE("jdk/internal/misc", Unsafe, writeback0, "(J)V") { return value_null(); }
+DECLARE_NATIVE("jdk/internal/misc", Unsafe, writebackPreSync0, "()V") { return value_null(); }
+DECLARE_NATIVE("jdk/internal/misc", Unsafe, writebackPostSync0, "()V") { return value_null(); }
+
+DECLARE_NATIVE("jdk/internal/misc", Unsafe, defineClass0,
                "(Ljava/lang/String;[BIILjava/lang/ClassLoader;Ljava/security/"
                "ProtectionDomain;)Ljava/lang/Class;") {
   DCHECK(argc == 6);

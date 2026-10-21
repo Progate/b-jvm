@@ -5,13 +5,22 @@
 
 DECLARE_NATIVE("java/lang/ref", Finalizer, isFinalizationEnabled, "()Z") { return (stack_value){.i = 0}; }
 
+// JDK 25 では PhantomReference が独自の native 宣言を持つため、両方に登録する
 DECLARE_NATIVE("java/lang/ref", Reference, refersTo0, "(Ljava/lang/Object;)Z") {
   DCHECK(argc == 1);
   struct native_Reference *ref = (void *)obj->obj;
   return (stack_value){.i = ref->referent == args[0].handle->obj};
 }
 
+DECLARE_NATIVE("java/lang/ref", PhantomReference, refersTo0, "(Ljava/lang/Object;)Z") {
+  DCHECK(argc == 1);
+  struct native_Reference *ref = (void *)obj->obj;
+  return (stack_value){.i = ref->referent == args[0].handle->obj};
+}
+
 DECLARE_NATIVE("java/lang/ref", Reference, clear0, "()V") { return value_null(); }
+
+DECLARE_NATIVE("java/lang/ref", PhantomReference, clear0, "()V") { return value_null(); }
 
 DECLARE_ASYNC_NATIVE("java/lang/ref", Reference, waitForReferencePendingList, "()V",
                      locals(rr_wakeup_info wakeup_info;), invoked_methods()) {
@@ -25,6 +34,10 @@ DECLARE_ASYNC_NATIVE("java/lang/ref", Reference, waitForReferencePendingList, "(
   }
 
   ASYNC_END_VOID();
+}
+
+DECLARE_NATIVE("java/lang/ref", Reference, hasReferencePendingList, "()Z") {
+  return (stack_value){.i = thread->vm->reference_pending_list != nullptr};
 }
 
 DECLARE_NATIVE("java/lang/ref", Reference, getAndClearReferencePendingList, "()Ljava/lang/ref/Reference;") {

@@ -467,7 +467,11 @@ static int checked_pc(u32 insn_pc, int offset, classfile_parse_ctx *ctx) {
   int target;
   int overflow = __builtin_add_overflow(insn_pc, offset, &target);
   if (overflow || target < 0 || target >= ctx->current_code_max_pc) {
-    format_error_static("Branch target out of bounds");
+    // どの命令の分岐が外れたか分からないと再現調査が難しいので、pc と境界をメッセージに残す
+    char buf[96];
+    snprintf(buf, sizeof(buf), "Branch target out of bounds: pc=%u offset=%d target=%d code_len=%d", insn_pc,
+             offset, target, ctx->current_code_max_pc);
+    format_error_dynamic(strdup(buf));
   }
   return target;
 }
@@ -475,10 +479,10 @@ static int checked_pc(u32 insn_pc, int offset, classfile_parse_ctx *ctx) {
 static bytecode_insn parse_tableswitch_insn(cf_byteslice *reader, int pc, classfile_parse_ctx *ctx) {
   int original_pc = pc++;
 
-  // consume u8s until pc = 0 mod 4
-  while (pc % 4 != 0) {
+  // opcode 直後の位置からコード先頭基準で 4 バイト境界まで読み飛ばす
+  int padding = (4 - pc % 4) % 4;
+  for (int i = 0; i < padding; ++i) {
     reader_next_u8(reader, "tableswitch padding");
-    pc++;
   }
 
   int default_target = checked_pc(original_pc, reader_next_s32(reader, "tableswitch default target"), ctx);
@@ -506,9 +510,9 @@ static bytecode_insn parse_tableswitch_insn(cf_byteslice *reader, int pc, classf
 
 static bytecode_insn parse_lookupswitch_insn(cf_byteslice *reader, int pc, classfile_parse_ctx *ctx) {
   int original_pc = pc++;
-  while (pc % 4 != 0) {
+  int padding = (4 - pc % 4) % 4;
+  for (int i = 0; i < padding; ++i) {
     reader_next_u8(reader, "tableswitch padding");
-    pc++;
   }
 
   int default_target = checked_pc(original_pc, reader_next_s32(reader, "lookupswitch default target"), ctx);

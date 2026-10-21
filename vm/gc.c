@@ -105,6 +105,8 @@ static void enumerate_reflection_roots(gc_ctx *ctx, classdesc *desc) {
 
 static void push_thread_roots(gc_ctx *ctx, vm_thread *thr) {
   PUSH_ROOT(&thr->thread_obj);
+  PUSH_ROOT(&thr->carrier_obj);
+  PUSH_ROOT(&thr->scoped_value_cache);
   PUSH_ROOT(&thr->current_exception);
 
   // To prevent double GC roots on shared stuff, we start from the highest address (innermost) frames and walk down,

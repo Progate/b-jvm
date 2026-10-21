@@ -670,6 +670,14 @@ typedef struct vm_thread {
 
   // Instance of java.lang.Thread
   struct native_Thread *thread_obj;
+
+  // この VM スレッドに対応するプラットフォーム Thread。仮想スレッドが mount されると
+  // thread_obj は VT に差し替わるが、carrier_obj はキャリアのまま残る
+  struct native_Thread *carrier_obj;
+
+  // ScopedValue のルックアップ用に Thread ごとにキャッシュされる Object[]
+  // （Thread.scopedValueCache() の実体）。Java 側のフィールドではなく VM が保持する
+  obj_header *scoped_value_cache;
   object putative_system_cl;
 
   // Array of handles, see handle (null entries are free for use)

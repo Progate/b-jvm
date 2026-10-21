@@ -554,7 +554,7 @@ static slice get_default_boot_cp() {
   }
 #endif
 
-  return STR("./jdk23.jar");
+  return STR("./jdk.jar");
 }
 
 vm_options default_vm_options() {
@@ -924,6 +924,7 @@ vm_thread *create_main_thread(vm *vm, thread_options options) {
   handle *java_thread = make_handle(thr, new_object(thr, cached_classes(vm)->thread));
 #define java_thr ((struct native_Thread *)java_thread->obj)
   thr->thread_obj = java_thr;
+  thr->carrier_obj = java_thr;
 
   java_thr->eetop = (s64)(uintptr_t)thr;
   object name = MakeJStringFromCString(thr, "main", true);
@@ -971,6 +972,39 @@ vm_thread *create_main_thread(vm *vm, thread_options options) {
         }
         printf("Error in init phase %.*s: %.*s, %s\n", fmt_slice(thr->current_exception->descriptor->name),
                fmt_slice(phases[i]), obj.obj ? message.chars : "no message");
+        // initPhase1 時点では System.err がまだ無く printStackTrace が出せないので、
+        // backtrace フィールドを直接辿って落ちた場所だけダンプする
+        {
+          struct native_Throwable *t = (struct native_Throwable *)thr->current_exception;
+          if (t->method)
+            fprintf(stderr, "  faulting method: %.*s.%.*s insn=%d\n", fmt_slice(t->method->my_class->name),
+                    fmt_slice(t->method->name), t->faulting_insn);
+          if (t->detailMessage) {
+            heap_string dm = {0};
+            if (read_string_to_utf8(thr, &dm, t->detailMessage) == 0) {
+              fprintf(stderr, "  detailMessage: %.*s\n", (int)dm.len, dm.chars);
+              free_heap_str(dm);
+            }
+          }
+          if (t->backtrace) {
+            int n = ArrayLength(t->backtrace);
+            for (int k = 0; k < n; ++k) {
+              struct native_StackTraceElement *e =
+                  (void *)*((obj_header **)ArrayData(t->backtrace) + k);
+              if (!e) continue;
+              heap_string cls = {0}, mname = {0}, fn = {0};
+              if (e->declaringClass) read_string_to_utf8(thr, &cls, e->declaringClass);
+              if (e->methodName) read_string_to_utf8(thr, &mname, e->methodName);
+              if (e->fileName) read_string_to_utf8(thr, &fn, e->fileName);
+              fprintf(stderr, "  at %.*s.%.*s(%.*s:%d)\n", cls.chars ? (int)cls.len : 0,
+                      cls.chars ?: "", mname.chars ? (int)mname.len : 0, mname.chars ?: "",
+                      fn.chars ? (int)fn.len : 0, fn.chars ?: "", e->lineNumber);
+              free_heap_str(cls);
+              free_heap_str(mname);
+              free_heap_str(fn);
+            }
+          }
+        }
         abort();
       }
 
@@ -1044,6 +1078,7 @@ vm_thread *create_vm_thread(vm *vm, vm_thread *creator_thread, struct native_Thr
   thr->stack_overflow_error = new_object(thr, cached_classes(vm)->stack_overflow_error);
 
   thr->thread_obj = (struct native_Thread *)java_thread->obj;
+  thr->carrier_obj = thr->thread_obj;
   drop_handle(creator_thread, java_thread);
 
   if (initializing) {
@@ -1492,6 +1527,10 @@ classdesc *define_class(vm_thread *thread, classloader *cl, slice chars, const u
 
   parse_result_t error = parse_classfile(classfile_bytes, classfile_len, class, &format_error);
   if (error != PARSE_SUCCESS) {
+    fprintf(stderr, "ClassFormatError while parsing %.*s: %.*s (first bytes %02x %02x %02x %02x, len %zu)\n",
+            (int)chars.len, chars.chars, (int)format_error.len, format_error.chars ? format_error.chars : "",
+            classfile_len > 0 ? classfile_bytes[0] : 0, classfile_len > 1 ? classfile_bytes[1] : 0,
+            classfile_len > 2 ? classfile_bytes[2] : 0, classfile_len > 3 ? classfile_bytes[3] : 0, classfile_len);
     raise_vm_exception(thread, STR("java/lang/ClassFormatError"), hslc(format_error));
     class->linkage_error = thread->current_exception;
     free_heap_str(format_error);
@@ -2353,6 +2392,10 @@ struct native_Class *get_class_mirror(vm_thread *thread, classdesc *cd) {
     }
     object componentType = cd->one_fewer_dim ? (void *)get_class_mirror(thread, cd->one_fewer_dim) : nullptr;
     class_mirror->componentType = componentType;
+    // JDK 25 では Class.isPrimitive/isInterface などが native ではなくフィールド読み出しに
+    // 変わった。HotSpot の java_lang_Class::create_mirror 相当として、VM 側で書き込む。
+    class_mirror->primitive = cd->kind == CD_KIND_PRIMITIVE;
+    class_mirror->modifiers = cd->access_flags & 0xffff;
     // アプリクラスパス由来のクラスは bjvm.SystemClassLoader の mirror を入れる。
     // JDK では Class.classLoader フィールド経由で getClassLoader() が返るため
     //（bootstrap クラスは null のまま）

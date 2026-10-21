@@ -52,8 +52,7 @@ struct native_LambdaForm {
 struct native_CallSite {
   obj_header base;
   // my fields
-  obj_header *target;  // Ljava/lang/invoke/MethodHandle;
-  obj_header *context; // Ljava/lang/invoke/MethodHandleNatives$CallSiteContext;
+  obj_header *target; // Ljava/lang/invoke/MethodHandle;
 };
 struct native_ConstantPool {
   obj_header base;
@@ -74,8 +73,12 @@ struct native_Class {
   obj_header *module;                // Ljava/lang/Module;
   obj_header *classLoader;           // Ljava/lang/ClassLoader;
   obj_header *classData;             // Ljava/lang/Object;
+  obj_header *signers;               // [Ljava/lang/Object;
+  s32 modifiers;                     // C
+  s32 primitive;                     // Z
   obj_header *packageName;           // Ljava/lang/String;
   obj_header *componentType;         // Ljava/lang/Class;
+  obj_header *protectionDomain;      // Ljava/security/ProtectionDomain;
   obj_header *reflectionData;        // Ljava/lang/ref/SoftReference;
   s32 classRedefinedCount;           // I
   obj_header *genericInfo;           // Lsun/reflect/generics/repository/ClassRepository;
@@ -134,11 +137,11 @@ struct native_Field {
   s32 modifiers;                     // I
   s32 trustedFinal;                  // Z
   obj_header *signature;             // Ljava/lang/String;
-  obj_header *genericInfo;           // Lsun/reflect/generics/repository/FieldRepository;
   obj_header *annotations;           // [B
+  obj_header *root;                  // Ljava/lang/reflect/Field;
+  obj_header *genericInfo;           // Lsun/reflect/generics/repository/FieldRepository;
   obj_header *fieldAccessor;         // Ljdk/internal/reflect/FieldAccessor;
   obj_header *overrideFieldAccessor; // Ljdk/internal/reflect/FieldAccessor;
-  obj_header *root;                  // Ljava/lang/reflect/Field;
   obj_header *declaredAnnotations;   // Ljava/util/Map;
 };
 struct native_Method {
@@ -160,12 +163,13 @@ struct native_Method {
   obj_header *exceptionTypes;       // [Ljava/lang/Class;
   s32 modifiers;                    // I
   obj_header *signature;            // Ljava/lang/String;
-  obj_header *genericInfo;          // Lsun/reflect/generics/repository/MethodRepository;
   obj_header *annotations;          // [B
   obj_header *parameterAnnotations; // [B
   obj_header *annotationDefault;    // [B
-  obj_header *methodAccessor;       // Ljdk/internal/reflect/MethodAccessor;
   obj_header *root;                 // Ljava/lang/reflect/Method;
+  obj_header *genericInfo;          // Lsun/reflect/generics/repository/MethodRepository;
+  obj_header *methodAccessor;       // Ljdk/internal/reflect/MethodAccessor;
+  s32 hash;                         // I
   s32 callerSensitive;              // B
 };
 struct native_Constructor {
@@ -185,11 +189,11 @@ struct native_Constructor {
   obj_header *exceptionTypes;       // [Ljava/lang/Class;
   s32 modifiers;                    // I
   obj_header *signature;            // Ljava/lang/String;
-  obj_header *genericInfo;          // Lsun/reflect/generics/repository/ConstructorRepository;
   obj_header *annotations;          // [B
   obj_header *parameterAnnotations; // [B
-  obj_header *constructorAccessor;  // Ljdk/internal/reflect/ConstructorAccessor;
   obj_header *root;                 // Ljava/lang/reflect/Constructor;
+  obj_header *genericInfo;          // Lsun/reflect/generics/repository/ConstructorRepository;
+  obj_header *constructorAccessor;  // Ljdk/internal/reflect/ConstructorAccessor;
 };
 struct native_Thread {
   obj_header base;
@@ -202,7 +206,6 @@ struct native_Thread {
   obj_header *name;                          // Ljava/lang/String;
   s32 interrupted;                           // Z
   obj_header *contextClassLoader;            // Ljava/lang/ClassLoader;
-  obj_header *inheritedAccessControlContext; // Ljava/security/AccessControlContext;
   obj_header *holder;                        // Ljava/lang/Thread$FieldHolder;
   obj_header *threadLocals;                  // Ljava/lang/ThreadLocal$ThreadLocalMap;
   obj_header *inheritableThreadLocals;       // Ljava/lang/ThreadLocal$ThreadLocalMap;

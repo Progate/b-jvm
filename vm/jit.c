@@ -2170,7 +2170,12 @@ static s32 compile(cp_method *method) {
   free(c->body.data);
   free(c->block_of_pc);
 
-  s32 index = c->failed ? -1 : jit_host_install(module.data, module.len);
+  // jit_host_install は wasm 側の import 関数なので、ネイティブビルド（JIT_SUPPORTED=0）
+  // ではそもそも宣言自体が存在しない
+  s32 index = -1;
+#if JIT_SUPPORTED
+  index = c->failed ? -1 : jit_host_install(module.data, module.len);
+#endif
   free(module.data);
   return index > 0 ? index : -1;
 }

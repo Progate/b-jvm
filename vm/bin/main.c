@@ -291,6 +291,17 @@ object ffi_create_string_array(vm_thread *thread, const char *packed, int count)
   return result;
 }
 
+/**
+ * Read element `index` of an Object[] created by ffi_create_string_array. Only safe to call while no
+ * Java allocation can happen on the JS side: the returned bare pointer goes stale at the next GC, so
+ * it must be handed to the scheduler (whose pending calls are GC roots) before anything else runs.
+ */
+EMSCRIPTEN_KEEPALIVE
+object ffi_object_array_get(object array, int index) {
+  assert(array);
+  return ((object *)ArrayData(array))[index];
+}
+
 EMSCRIPTEN_KEEPALIVE
 uint8_t *ffi_get_string_data(object str) {
   assert(str);

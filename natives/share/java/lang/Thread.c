@@ -47,7 +47,7 @@ DECLARE_NATIVE("java/lang", Thread, getNextThreadIdOffset, "()J") {
 }
 
 DECLARE_NATIVE("java/lang", Thread, currentCarrierThread, "()Ljava/lang/Thread;") {
-  return (stack_value){.obj = (void *)thread->thread_obj};
+  return (stack_value){.obj = (void *)thread->carrier_obj};
 }
 
 DECLARE_NATIVE("java/lang", Thread, interrupt0, "()V") {
@@ -113,4 +113,77 @@ DECLARE_ASYNC_NATIVE("java/lang", Thread, yield0, "()V", locals(rr_wakeup_info w
   DEBUG_PEDANTIC_YIELD(self->wakeup_info);
 
   ASYNC_END_VOID();
+}
+
+// レシーバのキャリア VM スレッドが現在動かしている Thread を差し替える。
+// 仮想スレッドの mount/unmount で、実行中の Thread.currentThread() の見え方を変える
+DECLARE_NATIVE("java/lang", Thread, setCurrentThread, "(Ljava/lang/Thread;)V") {
+  for (int i = 0; i < arrlen(thread->vm->active_threads); ++i) {
+    vm_thread *carrier = thread->vm->active_threads[i];
+    if ((obj_header *)carrier->carrier_obj == obj->obj) {
+      carrier->thread_obj = (struct native_Thread *)args[0].handle->obj;
+      return value_null();
+    }
+  }
+  return value_null();
+}
+
+// ScopedValue の検索は Thread の scopedValueBindings フィールドから始まる
+DECLARE_NATIVE("java/lang", Thread, findScopedValueBindings, "()Ljava/lang/Object;") {
+  return (stack_value){
+      .obj = thread->thread_obj ? (void *)thread->thread_obj->scopedValueBindings : nullptr};
+}
+
+// ScopedValue のルックアップキャッシュ。Java 側のフィールドではなく VM スレッドが保持する
+DECLARE_NATIVE("java/lang", Thread, scopedValueCache, "()[Ljava/lang/Object;") {
+  return (stack_value){.obj = (void *)thread->scoped_value_cache};
+}
+
+DECLARE_NATIVE("java/lang", Thread, setScopedValueCache, "([Ljava/lang/Object;)V") {
+  thread->scoped_value_cache = args[0].handle->obj;
+  return value_null();
+}
+
+// 生きているプラットフォームスレッドの一覧（Thread.getAllStackTraces 等が使う）
+DECLARE_NATIVE("java/lang", Thread, getThreads, "()[Ljava/lang/Thread;") {
+  vm *vm = thread->vm;
+  obj_header *arr = CreateObjectArray1D(thread, cached_classes(vm)->thread, arrlen(vm->active_threads));
+  if (!arr) {
+    return value_null();
+  }
+  int j = 0;
+  for (int i = 0; i < arrlen(vm->active_threads); ++i) {
+    object tobj = (object)vm->active_threads[i]->thread_obj;
+    if (tobj) {
+      *((void **)ArrayData(arr) + j++) = tobj;
+    }
+  }
+  return (stack_value){.obj = arr};
+}
+
+// 各スレッドの現在位置から StackTraceElement[] を組み立てる。
+// 他スレッドはスケジューラに譲った点で止まっているのでフレームはそのまま読める
+DECLARE_NATIVE("java/lang", Thread, dumpThreads, "([Ljava/lang/Thread;)[[Ljava/lang/StackTraceElement;") {
+  vm *vm = thread->vm;
+  classdesc *ste = cached_classes(vm)->stack_trace_element;
+  classdesc *ste_arr = get_or_create_array_classdesc(thread, ste);
+  int n = args[0].handle->obj ? ArrayLength(args[0].handle->obj) : 0;
+  obj_header *outer = CreateObjectArray1D(thread, ste_arr, n);
+  if (!outer) {
+    return value_null();
+  }
+  for (int i = 0; i < n; ++i) {
+    object tobj = *((object *)ArrayData(args[0].handle->obj) + i);
+    vm_thread *target = nullptr;
+    for (int k = 0; k < arrlen(vm->active_threads); ++k) {
+      if ((object)vm->active_threads[k]->thread_obj == tobj) {
+        target = vm->active_threads[k];
+        break;
+      }
+    }
+    object trace = target ? build_stack_trace(thread, target->stack.top, count_frames(target->stack.top))
+                          : CreateObjectArray1D(thread, ste, 0);
+    *((void **)ArrayData(outer) + i) = trace;
+  }
+  return (stack_value){.obj = outer};
 }

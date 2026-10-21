@@ -22,7 +22,7 @@ obj_header **backtrace_object(obj_header *throwable) { return &((struct native_T
  * （例外は保留されている）。要素の確保に途中で失敗したら、そこまで埋めた配列を返す。
  * 例外の fillInStackTrace と、ほかのスレッドの Thread.getStackTrace（getStackTrace0）が使う
  */
-static object build_stack_trace(vm_thread *thread, stack_frame *frame, int n_frames) {
+object build_stack_trace(vm_thread *thread, stack_frame *frame, int n_frames) {
   classdesc *StackTraceElement = cached_classes(thread->vm)->stack_trace_element;
   handle *stack_trace = make_handle(thread, CreateObjectArray1D(thread, StackTraceElement, n_frames));
   if (!stack_trace->obj) { // Failed to allocate
@@ -89,7 +89,7 @@ static object build_stack_trace(vm_thread *thread, stack_frame *frame, int n_fra
   return result;
 }
 
-static int count_frames(stack_frame *frame) {
+int count_frames(stack_frame *frame) {
   int n_frames = 0;
   for (; frame; frame = frame->prev)
     ++n_frames;

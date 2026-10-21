@@ -301,12 +301,33 @@ scheduler_status_t rr_scheduler_execute_immediately(execution_record *record) {
           return SCHEDULER_RESULT_INVAL;
         }
 
+        // rr_scheduler_step と同じ終了処理: record を完了させ、rr_scheduler_run が
+        // コピーした引数列を解放してからキューから外す（arrdel すると call は
+        // 次の要素を指すので、record は先に取り出しておく）
+        execution_record *rec = call->record;
+        rec->status = SCHEDULER_RESULT_DONE;
+        rec->returned = call->call._result;
+        if (call->call.args.method->descriptor->return_type.repr_kind == TYPE_KIND_REFERENCE &&
+            rec->returned.obj) {
+          rec->js_handle = make_js_handle(scheduler->vm, rec->returned.obj);
+        } else {
+          rec->js_handle = -1;
+        }
+        free(call->call.args.args);
         arrdel(info->call_queue, 0);
-        if (call->record == record) {
+        if (rec == record) {
+          if (arrlen(info->call_queue) == 0) {
+            arrdel(I->round_robin, i);
+            free_thread_info(scheduler, info);
+          }
           return SCHEDULER_RESULT_DONE;
         }
       }
 
+      if (arrlen(info->call_queue) == 0) {
+        arrdel(I->round_robin, i);
+        free_thread_info(scheduler, info);
+      }
       break;
     }
   }

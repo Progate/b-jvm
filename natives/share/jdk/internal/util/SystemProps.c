@@ -4,14 +4,15 @@
 
 #include <unistd.h>
 
-// COPIED FROM https://github.com/openjdk/jdk/blob/jdk23/src/java.base/share/classes/jdk/internal/util/SystemProps.java
+// COPIED FROM https://github.com/openjdk/jdk/blob/jdk25/src/java.base/share/classes/jdk/internal/util/SystemProps.java
+// Raw のインデックス順は Java 側の @Native 定数と 1 つでもずれると配列外参照になるので、
+// JDK を上げるたびに upstream の並びと突き合わせる
 enum {
   _display_country_NDX = 0,
   _display_language_NDX = 1 + _display_country_NDX,
   _display_script_NDX = 1 + _display_language_NDX,
   _display_variant_NDX = 1 + _display_script_NDX,
-  _file_encoding_NDX = 1 + _display_variant_NDX,
-  _file_separator_NDX = 1 + _file_encoding_NDX,
+  _file_separator_NDX = 1 + _display_variant_NDX,
   _format_country_NDX = 1 + _file_separator_NDX,
   _format_language_NDX = 1 + _format_country_NDX,
   _format_script_NDX = 1 + _format_language_NDX,
@@ -26,7 +27,8 @@ enum {
   _https_proxyPort_NDX = 1 + _https_proxyHost_NDX,
   _java_io_tmpdir_NDX = 1 + _https_proxyPort_NDX,
   _line_separator_NDX = 1 + _java_io_tmpdir_NDX,
-  _os_arch_NDX = 1 + _line_separator_NDX,
+  _native_encoding_NDX = 1 + _line_separator_NDX,
+  _os_arch_NDX = 1 + _native_encoding_NDX,
   _os_name_NDX = 1 + _os_arch_NDX,
   _os_version_NDX = 1 + _os_name_NDX,
   _path_separator_NDX = 1 + _os_version_NDX,
@@ -34,7 +36,8 @@ enum {
   _socksProxyHost_NDX = 1 + _socksNonProxyHosts_NDX,
   _socksProxyPort_NDX = 1 + _socksProxyHost_NDX,
   _stderr_encoding_NDX = 1 + _socksProxyPort_NDX,
-  _stdout_encoding_NDX = 1 + _stderr_encoding_NDX,
+  _stdin_encoding_NDX = 1 + _stderr_encoding_NDX,
+  _stdout_encoding_NDX = 1 + _stdin_encoding_NDX,
   _sun_arch_abi_NDX = 1 + _stdout_encoding_NDX,
   _sun_arch_data_model_NDX = 1 + _sun_arch_abi_NDX,
   _sun_cpu_endian_NDX = 1 + _sun_arch_data_model_NDX,
@@ -72,9 +75,10 @@ DECLARE_NATIVE("jdk/internal/util", SystemProps_Raw, platformProperties, "()[Lja
     ReferenceArrayStore(props->obj, index, str);                                                                       \
   }
 
-  SET_PROP(_file_encoding_NDX, "UTF-8");
+  SET_PROP(_native_encoding_NDX, "UTF-8");
   SET_PROP(_stdout_encoding_NDX, "UTF-8");
   SET_PROP(_stderr_encoding_NDX, "UTF-8");
+  SET_PROP(_stdin_encoding_NDX, "UTF-8");
   SET_PROP(_file_separator_NDX, "/");
   SET_PROP(_java_io_tmpdir_NDX, "/tmp");
   SET_PROP(_line_separator_NDX, "\n");
@@ -124,12 +128,13 @@ DECLARE_NATIVE("jdk/internal/util", SystemProps_Raw, vmProperties, "()[Ljava/lan
   INIT_STACK_STRING(java_home, 1024);
 #ifdef __wasi__
   // WASI 版は起動時に PWD へ chdir する（→ vm/bin/main.c）ので、cwd からは決めない。
-  // browser-java は JDK を必ず /jdk23 に置く（→ src/mount-paths.ts の JAVA_HOME）
-  java_home = bprintf(java_home, "/jdk23");
+  // browser-java は JDK を必ず /jdk に置く（→ src/mount-paths.ts の JAVA_HOME）。
+  // 版を名に入れないのは、JDK を上げるたびに wasm を作り直す羽目になるからである
+  java_home = bprintf(java_home, "/jdk");
 #else
   char cwd[1024] = {0};
   CHECK(cwd == getcwd(cwd, 1024));
-  java_home = bprintf(java_home, "%s/jdk23", cwd);
+  java_home = bprintf(java_home, "%s/jdk", cwd);
 #endif
 
   SET_PROP(1, java_home.chars);

@@ -19,6 +19,10 @@ obj_header *MakeJStringFromCString(vm_thread *thread, char const *data, bool int
 obj_header *MakeJStringFromData(vm_thread *thread, slice data, string_coder_kind encoding);
 obj_header *InternJString(vm_thread *thread, obj_header *str);
 
+// Throwable.c で定義。`frame` から根元までの StackTraceElement[] を作る
+obj_header *build_stack_trace(vm_thread *thread, stack_frame *frame, int n_frames);
+int count_frames(stack_frame *frame);
+
 /// Helper for java.lang.String#length
 static inline int JavaStringLength(vm_thread *thread, obj_header *string) {
   DCHECK(utf8_equals(string->descriptor->name, "java/lang/String"));

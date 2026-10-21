@@ -243,6 +243,10 @@ static char *add_classpath_entry(classpath *cp, slice entry) {
   return nullptr;
 }
 
+// 実行中にエントリを追加する。-javaagent の jar と Instrumentation.appendToClassLoaderSearch が使う。
+// 失敗時はヒープ確保したエラーメッセージを返す（呼び出し側が free する）
+char *classpath_add_entry(classpath *cp, slice entry) { return add_classpath_entry(cp, entry); }
+
 char *init_classpath(classpath *cp, slice path) {
   cp->entries = nullptr;
   cp->as_colon_separated = make_heap_str_from(path);
@@ -275,15 +279,13 @@ void free_classpath(classpath *cp) {
   memset(cp, 0, sizeof(*cp)); // for good measure
 }
 
-enum jar_lookup_result { NOT_FOUND, FOUND, CORRUPT /* e.g. if INFLATE fails */ };
-
 // Returns true if found
 enum jar_lookup_result jar_lookup(mapped_jar *jar, slice filename, u8 **bytes, size_t *len) {
   jar_entry *jar_entry = hash_table_lookup(&jar->entries, filename.chars, filename.len);
   if (jar_entry) {
     // Check header at jar_entry->header
     if (memcmp(jar_entry->header, "PK\003\004", 4) != 0) {
-      return CORRUPT;
+      return JAR_CORRUPT;
     }
 
     // Find the compressed data
@@ -292,14 +294,14 @@ enum jar_lookup_result jar_lookup(mapped_jar *jar, slice filename, u8 **bytes, s
     memcpy(&extra_len, jar_entry->header + 28, 2);
     u32 offset = 30 + filename_len + extra_len;
     if ((u64)offset + jar_entry->compressed_size + (jar_entry->header - jar->data) > jar->size_bytes) {
-      return CORRUPT;
+      return JAR_CORRUPT;
     }
 
     char *data = jar_entry->header + offset;
     if (!jar_entry->is_compressed) {
       *bytes = malloc(*len = jar_entry->claimed_uncompressed_size);
       memcpy(*bytes, data, jar_entry->claimed_uncompressed_size);
-      return FOUND;
+      return JAR_FOUND;
     }
 
     // Call into zlib
@@ -312,20 +314,20 @@ enum jar_lookup_result jar_lookup(mapped_jar *jar, slice filename, u8 **bytes, s
     stream.avail_out = jar_entry->claimed_uncompressed_size;
 
     if (inflateInit2(&stream, -MAX_WBITS) != Z_OK) {
-      return CORRUPT;
+      return JAR_CORRUPT;
     }
 
     int result = inflate(&stream, Z_FINISH);
     if (result != Z_STREAM_END) {
       inflateEnd(&stream);
-      return CORRUPT;
+      return JAR_CORRUPT;
     }
 
     *len = stream.total_out;
     inflateEnd(&stream);
-    return FOUND;
+    return JAR_FOUND;
   }
-  return NOT_FOUND;
+  return JAR_NOT_FOUND;
 }
 
 static heap_string concat_path(heap_string name, slice filename) {
@@ -357,10 +359,10 @@ int lookup_classpath_idx(classpath *cp, const slice filename, u8 **bytes, size_t
     classpath_entry *entry = &cp->entries[i];
     if (entry->jar) {
       enum jar_lookup_result result = jar_lookup(entry->jar, filename, bytes, len);
-      if (result == NOT_FOUND)
+      if (result == JAR_NOT_FOUND)
         continue;
-      if (result == FOUND && matched_index) *matched_index = i;
-      return -(result == CORRUPT);
+      if (result == JAR_FOUND && matched_index) *matched_index = i;
+      return -(result == JAR_CORRUPT);
     }
     // Concatenate with the desired filename (and optionally a / in between)
     heap_string search = concat_path(entry->name, filename);
