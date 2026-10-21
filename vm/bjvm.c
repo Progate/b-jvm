@@ -885,6 +885,23 @@ static void init_unsafe_constants(vm_thread *thread) {
 
 #define PROFILE_STARTUP 0 // if 1, prints out profiler data for startup
 
+// JDK 25 の ArraysSupport などは <clinit> で JavaLangAccess を固定する。
+// initPhase1 の登録を待つと、キャッシュクラスの初期化中に null が焼き付くので
+// ここで先に登録する（initPhase1 での再登録は単なる再代入で無害）
+static void register_java_lang_access(vm_thread *thr) {
+  classdesc *system = bootstrap_lookup_class(thr, STR("java/lang/System"));
+  CHECK(system);
+  thr->stack.synchronous_depth++;
+  initialize_class_t sys_init = {.args = {thr, system}};
+  future_t sys_fut = initialize_class(&sys_init);
+  thr->stack.synchronous_depth--;
+  CHECK(sys_fut.status == FUTURE_READY && !sys_init._result && !thr->current_exception);
+  cp_method *set_jla = method_lookup(system, STR("setJavaLangAccess"), STR("()V"), false, false);
+  CHECK(set_jla);
+  call_interpreter_synchronous(thr, set_jla, nullptr);
+  CHECK(!thr->current_exception);
+}
+
 vm_thread *create_main_thread(vm *vm, thread_options options) {
   vm_thread *thr = calloc(1, sizeof(vm_thread));
   arrput(vm->active_threads, thr);
@@ -911,6 +928,8 @@ vm_thread *create_main_thread(vm *vm, thread_options options) {
 
     vm_init_primitive_classes(thr);
     init_unsafe_constants(thr);
+
+    register_java_lang_access(thr);
 
     init_cached_classdescs_t init = {.args = {thr}};
     future_t result = init_cached_classdescs(&init);
@@ -1067,6 +1086,8 @@ vm_thread *create_vm_thread(vm *vm, vm_thread *creator_thread, struct native_Thr
 
     vm_init_primitive_classes(thr);
     init_unsafe_constants(thr);
+
+    register_java_lang_access(thr);
 
     init_cached_classdescs_t init = {.args = {thr}};
     future_t result = init_cached_classdescs(&init);
