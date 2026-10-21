@@ -350,10 +350,10 @@ crt が `init_modules` で全モジュールのコンストラクタを回し、
 - `vm/bin/main.c` … 空だった `main` に `_Exit(0)` を書いた（上記）
 - `vm/bin/main.c` … `main` は引数 2 つ（`envp` を取らない）。clang が wasm で `__main_argc_argv` と名付けるのは
   引数が 2 つの main だけで、crt1 はそれか `__main_void` しか呼ばない。3 引数だと main が呼ばれずに起動が止まる
-- `cmake/LinuxMuslSupport.cmake` … リンク時に解決できない名前は `__c_longjmp`（setjmp/longjmp のタグ。ローダーが配る）
-  だけを `--allow-undefined-file` で許す。`--unresolved-symbols=import-dynamic`（何でも import にする）は使わない
-  ——無い関数がリンクのエラーにならず、実行時に初めて落ちる。FP 例外フラグの `__fe_status` は wasm-ld が自分で
-  import にする（Progate/llvm-project#37）。`--unwindlib=none` も要らない（C のリンクは libunwind を NEEDED にしない）
+- `cmake/LinuxMuslSupport.cmake` … 無い名前は Linux と同じくリンクのエラーにする。`--unresolved-symbols=import-dynamic`
+  （何でも import にする）は使わない——無い関数がリンクのエラーにならず、実行時に初めて落ちる。ローダーが配る
+  `__c_longjmp`（setjmp/longjmp のタグ）と `__fe_status`（FP 例外フラグ）は wasm-ld が自分で import にする
+  （Progate/llvm-project#37・#39）。`--unwindlib=none` も要らない（C のリンクは libunwind を NEEDED にしない）
 - （Progate/packages の）`packages/browser-java/src/os-executable.ts` … 直接 instantiate + `initializeWasiP1WebAssemblyInstance` をやめ、
   `BrowserDyld.loadProgram` で libc.so と一緒に起こし、`startWasiP1WebAssemblyInstance` で
   `_start` を回す。malloc/free は libc.so の export から、メモリと関数表はローダーの実物から取り、

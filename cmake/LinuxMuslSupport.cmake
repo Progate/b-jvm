@@ -28,14 +28,10 @@ endfunction()
 # `-pie` with `Scrt1.o` and `NEEDED libc.so`, so there is no linker flag to write for any of it.
 # What is left here are only the deviations from that default.
 function(configure_linux_musl_pie TARGET)
-    # __c_longjmp is the exception tag setjmp/longjmp throw. No module defines it: every module
-    # imports it from env and the loader hands all of them the same Tag (libc.so imports it too).
-    # Only this one name may stay undefined, so a genuinely missing function still fails the link.
-    # (__fe_status, the FP exception flag global, needs no entry: wasm-ld imports it by name.)
-    set(allow_undefined "${CMAKE_CURRENT_BINARY_DIR}/linux-musl-allow-undefined.txt")
-    file(WRITE "${allow_undefined}" "__c_longjmp\n")
+    # Undefined names stay link errors, as on Linux. The two names the loader provides to every
+    # module, the exception tag __c_longjmp (setjmp/longjmp) and the FP exception flag global
+    # __fe_status, need nothing here: wasm-ld imports them by name in PIC links.
     target_link_options(${TARGET} PRIVATE
-            "-Wl,--allow-undefined-file=${allow_undefined}"
             # The ffi_* entry points are marked EMSCRIPTEN_KEEPALIVE, which on this target expands to
             # used + default visibility. -rdynamic is what turns that into actual wasm exports, and
             # also leaves the rest of b-jvm visible so the JIT's compiled code and the loader can
