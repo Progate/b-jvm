@@ -1,5 +1,6 @@
 #include "bjvm.h"
 #include <arrays.h>
+#include <linkage.h>
 #include <natives-dsl.h>
 
 DECLARE_NATIVE("java/lang/reflect", Array, newArray, "(Ljava/lang/Class;I)Ljava/lang/Object;") {
@@ -7,9 +8,11 @@ DECLARE_NATIVE("java/lang/reflect", Array, newArray, "(Ljava/lang/Class;I)Ljava/
   if (!args[0].handle->obj)
     return value_null();
   classdesc *class = unmirror_class(args[0].handle->obj);
-  initialize_class_t pox = {.args = {thread, class}};
-  future_t f = initialize_class(&pox);
-  CHECK(f.status == FUTURE_READY);
+  // 配列を作っても要素のクラスは初期化しない（anewarray と同じ）。初期化すると
+  // Array.newInstance(KtProperty.class, 0) で KtProperty の <clinit> が走り、kotlinc の
+  // 要素の種類の表（KtStubElementTypes → KtNodeTypes）が初期化の途中の null を読んでいた
+  if (link_class(thread, class))
+    return value_null();
   s32 count = args[1].i;
   obj_header *result;
   if (class->kind == CD_KIND_PRIMITIVE) {

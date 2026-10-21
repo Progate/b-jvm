@@ -1198,8 +1198,12 @@ DEFINE_ASYNC(resolve_mh_mt) {
           ? args->info->reference->field.class_info
           : args->info->reference->methodref.class_info;
 
-  resolve_class(args->thread, required_type);
-  AWAIT(initialize_class, args->thread, required_type->classdesc);
+  // MethodHandle の解決ではクラスを初期化しない（JVMS §5.4.3.5）。初期化は呼ばれたとき
+  // （DirectMethodHandle の ensureInitialized → Unsafe.ensureClassInitialized）に起きる。
+  // ここで初期化すると `KtProperty::new` のようなラムダを作っただけで KtProperty の <clinit> が走り、
+  // kotlinc の要素の種類の表（KtStubElementTypes → KtNodeTypes）が初期化の途中の null を読んでいた
+  if (!resolve_class(args->thread, required_type))
+    link_class(args->thread, required_type->classdesc);
 
   mh_type_info_t info = {};
   AWAIT(compute_mh_type_info, args->thread, args->cl, args->info, &info);
@@ -1248,9 +1252,10 @@ DEFINE_ASYNC(resolve_mh_vh) {
   DCHECK(mh_is_vh(info->handle_kind));
 
   cp_field_info *field = &info->reference->field;
-  resolve_class(thread, field->class_info);
-  AWAIT(initialize_class, thread, field->class_info->classdesc);
-  field = &info->reference->field; // reload because of the AWAIT
+  // 解決では初期化しない（JVMS §5.4.3.5）。DirectMethodHandle.make が、static の欄なら
+  // 呼ばれたときに初期化する形（ensureInitialized）で作る
+  if (!resolve_class(thread, field->class_info))
+    link_class(thread, field->class_info->classdesc);
 
   classdesc *DirectMethodHandle = get_DMH_class(thread);
   classdesc *MemberName = cached_classes(thread->vm)->member_name;
@@ -1282,9 +1287,10 @@ DEFINE_ASYNC(resolve_mh_invoke) {
 #define m (self->m)
 
   cp_method_info *method = &info->reference->methodref;
-  resolve_class(thread, method->class_info);
-  AWAIT(initialize_class, thread, info->reference->methodref.class_info->classdesc);
-  method = &info->reference->methodref; // reload because of the AWAIT
+  // 解決では初期化しない（JVMS §5.4.3.5）。`Lazy::new` のラムダを作っただけで Lazy の <clinit> が
+  // 走っていた。static メソッドとコンストラクターは DirectMethodHandle.make が呼ばれたときに初期化する
+  if (!resolve_class(thread, method->class_info))
+    link_class(thread, method->class_info->classdesc);
 
   m = method_lookup(method->class_info->classdesc, method->nat->name, method->nat->descriptor, true, true);
   if (MH_KIND_NEW_INVOKE_SPECIAL == info->handle_kind) {

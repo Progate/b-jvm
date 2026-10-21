@@ -384,16 +384,18 @@ static s64 java_irem(s32 const a, s32 const b) {
   return a % b;
 }
 
+// INT64_MIN を使う（wasm32 では long が 32 ビットなので LONG_MIN は INT32_MIN になり、
+// Long.MIN_VALUE / -1 が素通りして i64.div_s がトラップしていた）
 static s64 java_ldiv(s64 const a, s64 const b) {
   DCHECK(b != 0);
-  if (a == LONG_MIN && b == -1)
-    return LONG_MIN;
+  if (a == INT64_MIN && b == -1)
+    return INT64_MIN;
   return a / b;
 }
 
 static s64 java_lrem(s64 const a, s64 const b) {
   DCHECK(b != 0);
-  if (a == LONG_MIN && b == -1)
+  if (a == INT64_MIN && b == -1)
     return 0;
   return a % b;
 }
@@ -1176,7 +1178,9 @@ INTEGER_BIN_OP(ixor, (s32)((u32)a ^ (u32)b))
 INTEGER_BIN_OP(lxor, (s64)((u64)a ^ (u64)b))
 INTEGER_BIN_OP(ishl, (s32)((u32)a << (b & 0x1f)))
 INTEGER_BIN_OP(lshl, (s64)((u64)a << (b & 0x3f)))
-INTEGER_BIN_OP(ishr, (u32)((s32)a >> (b & 0x1f)))
+// int は TOS に符号拡張した 64 ビットで持つ（i2l はそれを前提に (s64) するだけ）。(u32) にすると
+// 負の数を右シフトした結果の上位 32 ビットが 0 になり、long に広げると 4294967295 などに化けていた
+INTEGER_BIN_OP(ishr, (s32)a >> (b & 0x1f))
 INTEGER_BIN_OP(lshr, (s64)a >> (b & 0x3f))
 INTEGER_BIN_OP(iushr, (s32)((u32)a >> (b & 0x1f)))
 INTEGER_BIN_OP(lushr, (s64)((u64)a >> (b & 0x3f)))
