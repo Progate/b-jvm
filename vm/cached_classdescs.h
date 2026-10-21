@@ -27,6 +27,8 @@ extern "C" {
   X(class_circle_error, "java/lang/ClassCircularityError")                                                             \
   X(incompatible_class_change_error, "java/lang/IncompatibleClassChangeError")                                         \
   X(abstract_method_error, "java/lang/AbstractMethodError")                                                            \
+  X(no_such_method_error, "java/lang/NoSuchMethodError")                                                               \
+  X(no_such_field_error, "java/lang/NoSuchFieldError")                                                                 \
   X(illegal_access_error, "java/lang/IllegalAccessError")                                                              \
   X(illegal_argument_exception, "java/lang/IllegalArgumentException")                                                  \
   X(arithmetic_exception, "java/lang/ArithmeticException")                                                             \

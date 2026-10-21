@@ -15,7 +15,46 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#ifdef __wasi__
+// UnixException.translateToIOException は errno を同梱 JDK の UnixConstants（Linux で生成）と
+// 比べて NoSuchFileException などを選ぶ。wasi-libc の errno は番号が違う（ENOENT が 44）ので、
+// そのままだとどれにも当たらず素の FileSystemException になり、NoSuchFileException を
+// 受け止めるつもりのコード（IntelliJ の Registry が読む early-access-registry.txt）が落ちる。
+// 表にあるのは UnixConstants にあるものだけで、それ以外は strerror のためにそのまま通す
+static const struct {
+  int wasi;
+  int linux;
+} errno_to_linux[] = {
+    {ENOENT, 2},     {ENXIO, 6},   {EACCES, 13},  {EEXIST, 17},  {ENOTDIR, 20}, {EINVAL, 22},
+    {EXDEV, 18},     {EISDIR, 21}, {ENOTEMPTY, 39}, {ENOSPC, 28}, {EAGAIN, 11},  {ENOSYS, 38},
+    {ELOOP, 40},     {EROFS, 30},  {ERANGE, 34},  {EMFILE, 24},
+};
+
+static int to_linux_errno(int code) {
+  for (size_t i = 0; i < sizeof(errno_to_linux) / sizeof(errno_to_linux[0]); ++i)
+    if (errno_to_linux[i].wasi == code)
+      return errno_to_linux[i].linux;
+  return code;
+}
+
+static int from_linux_errno(int code) {
+  for (size_t i = 0; i < sizeof(errno_to_linux) / sizeof(errno_to_linux[0]); ++i)
+    if (errno_to_linux[i].linux == code)
+      return errno_to_linux[i].wasi;
+  return code;
+}
+#else
+static int to_linux_errno(int code) { return code; }
+static int from_linux_errno(int code) { return code; }
+#endif
+
+static obj_header *create_unix_exception_from_linux(vm_thread *thread, int errno_code);
+
 static obj_header *create_unix_exception(vm_thread *thread, int errno_code) {
+  return create_unix_exception_from_linux(thread, to_linux_errno(errno_code));
+}
+
+static obj_header *create_unix_exception_from_linux(vm_thread *thread, int errno_code) {
   classdesc *classdesc = cached_classes(thread->vm)->unix_exception;
   obj_header *obj = new_object(thread, classdesc);
 
@@ -52,7 +91,7 @@ stack_value stat_impl(value *args) {
   uintptr_t buf = args[0].l;
   int result = stat((char *)buf, &st);
   if (result)
-    return (stack_value){.i = errno};
+    return (stack_value){.i = to_linux_errno(errno)};
 
   obj_header *attrs = args[1].handle->obj;
 
@@ -102,8 +141,12 @@ DECLARE_NATIVE("sun/nio/fs", UnixNativeDispatcher, stat0, "(JLsun/nio/fs/UnixFil
   return stat_impl(args);
 }
 
+// stat0 と違い lstat0 は失敗を UnixException で返す（JDK の宣言が throws UnixException）。
+// 黙って戻ると、無いパスが「属性がすべて 0 のファイル」に見える
 DECLARE_NATIVE("sun/nio/fs", UnixNativeDispatcher, lstat0, "(JLsun/nio/fs/UnixFileAttributes;)V") {
-  stat_impl(args);
+  stack_value result = stat_impl(args);
+  if (result.i != 0)
+    thread->current_exception = create_unix_exception_from_linux(thread, result.i);
   return value_null();
 }
 
@@ -204,6 +247,21 @@ DECLARE_NATIVE("sun/nio/fs", UnixNativeDispatcher, mkdir0, "(JI)V") {
   return value_null();
 }
 
+// Path.toRealPath。kotlinc はソースや jar のパスをこれで正規化する
+DECLARE_NATIVE("sun/nio/fs", UnixNativeDispatcher, realpath0, "(J)[B") {
+  char resolved[PATH_MAX];
+  if (!realpath((char const *)args[0].l, resolved)) {
+    thread->current_exception = create_unix_exception(thread, errno);
+    return value_null();
+  }
+  size_t len = strlen(resolved);
+  obj_header *array = CreatePrimitiveArray1D(thread, TYPE_KIND_BYTE, (int)len);
+  if (!array)
+    return value_null();
+  memcpy(ArrayData(array), resolved, len);
+  return (stack_value){.obj = array};
+}
+
 DECLARE_NATIVE("sun/nio/fs", UnixNativeDispatcher, rmdir, "(J)V") {
   int result = rmdir((char const *)args[0].l);
   if (result != 0)
@@ -261,7 +319,9 @@ DECLARE_NATIVE("sun/nio/ch", UnixFileDispatcherImpl, map0, "(Ljava/io/FileDescri
   return (stack_value){.l = (s64)result};
 }
 
-DECLARE_NATIVE("sun/nio/ch", UnixFileDispatcherImpl, unmap0, "(JJ)V") {
+// JDK 23 では int を返す（0 で成功）。(JJ)V のままだと UnsatisfiedLinkError になり、
+// MappedByteBuffer を解放する Cleaner のスレッドごと落ちる
+DECLARE_NATIVE("sun/nio/ch", UnixFileDispatcherImpl, unmap0, "(JJ)I") {
   void *addr = (void *)args[0].l;
   size_t len = args[1].l;
   for (size_t i = 0; i < arrlenu(thread->vm->mmap_allocations); ++i) {
@@ -274,7 +334,7 @@ DECLARE_NATIVE("sun/nio/ch", UnixFileDispatcherImpl, unmap0, "(JJ)V") {
   if (result) {
     thread->current_exception = create_unix_exception(thread, errno);
   }
-  return value_null();
+  return (stack_value){.i = 0};
 }
 
 // Ordinary (non-mapped) file I/O for FileChannel. The JDK reaches these whenever it goes through
@@ -361,7 +421,7 @@ DECLARE_NATIVE("sun/nio/ch", UnixFileDispatcherImpl, close0, "(Ljava/io/FileDesc
 }
 
 DECLARE_NATIVE("sun/nio/fs", UnixNativeDispatcher, strerror, "(I)[B") {
-  char *msg = strerror(args[0].i);
+  char *msg = strerror(from_linux_errno(args[0].i));
   size_t len = strlen(msg);
   obj_header *array = CreatePrimitiveArray1D(thread, TYPE_KIND_BYTE, len);
   if (!array) {

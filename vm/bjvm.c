@@ -1832,6 +1832,28 @@ void wrap_in_exception_in_initializer_error(vm_thread *thread) {
   drop_handle(thread, exc);
 }
 
+// Superinterfaces of a class that JVMS §5.5 step 7 initializes before the class itself: those
+// declaring a non-abstract, non-static method, in the order of a recursive enumeration where each
+// interface's superinterfaces come before the interface (left to right)
+static bool declares_default_method(const classdesc *iface) {
+  for (int i = 0; i < iface->methods_count; ++i) {
+    access_flags flags = iface->methods[i].access_flags;
+    if (!(flags & (ACCESS_ABSTRACT | ACCESS_STATIC)))
+      return true;
+  }
+  return false;
+}
+
+// NOLINTNEXTLINE(misc-no-recursion)
+static void collect_interfaces_to_initialize(const classdesc *cd, classdesc ***out) {
+  for (int i = 0; i < cd->interfaces_count; ++i) {
+    classdesc *iface = cd->interfaces[i]->classdesc;
+    collect_interfaces_to_initialize(iface, out);
+    if (declares_default_method(iface))
+      arrput(*out, iface);
+  }
+}
+
 // Call <clinit> on the class, if it hasn't already been called.
 // NOLINTNEXTLINE(misc-no-recursion)
 DEFINE_ASYNC(initialize_class) {
@@ -1887,6 +1909,7 @@ DEFINE_ASYNC(initialize_class) {
 
   cd->state = CD_STATE_INITIALIZING;
   cd->initializing_thread = thread->tid; // mark this thread as initializing the class
+  self->interfaces_to_init = nullptr;
 
   self->recursive_call_space = calloc(1, sizeof(initialize_class_t));
   if (!self->recursive_call_space) {
@@ -1902,13 +1925,22 @@ DEFINE_ASYNC(initialize_class) {
       goto done;
   }
 
-  for (self->i = 0; (int)self->i < cd->interfaces_count; ++self->i) {
-    AWAIT_INNER(self->recursive_call_space, initialize_class, thread, cd->interfaces[self->i]->classdesc);
+  // JVMS §5.5 step 7: only a class initializes superinterfaces first, and only those that
+  // declare a non-abstract, non-static method. Initializing every superinterface (or doing it
+  // for an interface) runs an interface's <clinit> while a subinterface is still mid-<clinit>,
+  // so it reads the subinterface's static fields as null (kotlin-reflect's KotlinTypeChecker
+  // reads NewKotlinTypeChecker.Companion this way)
+  if (!(cd->access_flags & ACCESS_INTERFACE)) {
+    collect_interfaces_to_initialize(cd, &self->interfaces_to_init);
+  }
+  for (self->i = 0; (int)self->i < arrlen(self->interfaces_to_init); ++self->i) {
+    AWAIT_INNER(self->recursive_call_space, initialize_class, thread, self->interfaces_to_init[self->i]);
     cd = args->classdesc;
 
     if ((error = self->recursive_call_space->_result))
       goto done;
   }
+  arrfree(self->interfaces_to_init);
   free(self->recursive_call_space);
   self->recursive_call_space = nullptr;
 
@@ -1930,6 +1962,7 @@ DEFINE_ASYNC(initialize_class) {
 
   error = 0;
 done:
+  arrfree(self->interfaces_to_init);
   free(self->recursive_call_space);
   args->classdesc->state = error ? CD_STATE_LINKAGE_ERROR : CD_STATE_INITIALIZED;
   args->classdesc->linkage_error = thread->current_exception;

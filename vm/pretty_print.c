@@ -135,6 +135,7 @@ const char *insn_code_to_string(insn_code_kind code) {
     CASE(monitorenter)
     CASE(monitorexit)
     CASE(nop)
+    CASE(reserved_zero)
     CASE(pop)
     CASE(pop2)
     CASE(return)

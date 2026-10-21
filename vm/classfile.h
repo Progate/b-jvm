@@ -35,6 +35,14 @@ cp_entry *check_cp_entry(cp_entry *entry, cp_kind expected_kinds, const char *re
  * fconst
  */
 typedef enum : u8 {
+  /**
+   * 0 はどの命令にも割り当てない。notco の解釈器は「次の命令の種類 × 4 + TOS の型」を
+   * 戻り値で返し、0 を「例外・中断」の合図に使う（interpreter2.c の `case 0`）。
+   * nop が 0 だと、TOS が空のときの nop がこの合図と同じ値になり、メソッドがその場で
+   * 抜けて null を返す。javac は nop を出さないが、kotlinc は inline 関数の境目に出す
+   */
+  insn_reserved_zero,
+
   /** No operands */
   insn_nop,
 

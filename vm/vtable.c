@@ -69,7 +69,66 @@ static slice identify(slice *scratch, const cp_method *method) {
   return *scratch;
 }
 
-static void merge_itable(itable *dst, const itable *src, string_hash_table poisoned, classdesc *classdesc) {
+// `sub` が `sup` の（真の）子インターフェースか。itables.interfaces は自分と全祖先を持つ
+static bool is_proper_subinterface(const classdesc *sub, const classdesc *sup) {
+  if (sub == sup)
+    return false;
+  for (int i = 0; i < arrlen(sub->itables.interfaces); ++i)
+    if (sub->itables.interfaces[i] == sup)
+      return true;
+  return false;
+}
+
+// JVMS §5.4.3.3 の maximally-specific superinterface methods から選ぶ。
+//
+// 候補は `cd` の全祖先インターフェース（直接の親インターフェースと superclass の itable に
+// 載っているもの）が宣言する、同じ名前・記述子の非 static・非 private メソッド。子インターフェースが
+// 宣言し直したものがあれば親の宣言は候補から外れる。残ったうち abstract でないものがちょうど 1 つなら
+// それ、2 つ以上なら曖昧、0 なら abstract（呼ぶと AbstractMethodError）
+static itable_method_t select_maximally_specific(classdesc *cd, classdesc *super, const cp_method *like) {
+  cp_method **candidates = nullptr;
+  for (int src_i = 0; src_i <= cd->interfaces_count; ++src_i) {
+    classdesc *src = src_i < cd->interfaces_count ? cd->interfaces[src_i]->classdesc : super;
+    if (!src)
+      continue;
+    for (int j = 0; j < arrlen(src->itables.interfaces); ++j) {
+      classdesc *iface = src->itables.interfaces[j];
+      cp_method *m = method_lookup(iface, like->name, like->unparsed_descriptor, false, false);
+      if (!m || (m->access_flags & (ACCESS_STATIC | ACCESS_PRIVATE)))
+        continue;
+      bool seen = false;
+      for (int k = 0; k < arrlen(candidates); ++k)
+        seen |= candidates[k] == m;
+      if (!seen)
+        arrput(candidates, m);
+    }
+  }
+
+  cp_method *chosen = nullptr, *any_maximal = nullptr;
+  int concrete = 0;
+  for (int i = 0; i < arrlen(candidates); ++i) {
+    bool maximal = true;
+    for (int k = 0; k < arrlen(candidates) && maximal; ++k)
+      maximal = !is_proper_subinterface(candidates[k]->my_class, candidates[i]->my_class);
+    if (!maximal)
+      continue;
+    any_maximal = any_maximal ? any_maximal : candidates[i];
+    if (!(candidates[i]->access_flags & ACCESS_ABSTRACT)) {
+      chosen = chosen ? chosen : candidates[i];
+      ++concrete;
+    }
+  }
+  arrfree(candidates);
+
+  if (concrete == 1)
+    return make(chosen);
+  if (concrete > 1)
+    return mark_ambiguous(make(chosen));
+  return make(any_maximal ? any_maximal : like);
+}
+
+static void merge_itable(itable *dst, const itable *src, string_hash_table poisoned, classdesc *super,
+                         classdesc *classdesc) {
   INIT_STACK_STRING(scratch, 1024);
   DCHECK(dst->interface == src->interface);
   DCHECK(arrlen(dst->methods) == arrlen(src->methods));
@@ -78,20 +137,15 @@ static void merge_itable(itable *dst, const itable *src, string_hash_table poiso
     DCHECK(s != 0, "i-table method must not be null");
     DCHECK(d != 0, "i-table method must not be null");
 
-    [[maybe_unused]]
-    bool d_abs = get_unambiguous_method(d)->access_flags & ACCESS_ABSTRACT,
-         c_abs = get_unambiguous_method(s)->access_flags & ACCESS_ABSTRACT;
-    if (d_abs || d == s) {
-      result = s; // c is concrete, or both are abstract so choose one
-    } else {
-      result = d; // d is concrete
-    }
-
-    // Now check if the method is ambiguous
     cp_method *d_method = get_unambiguous_method(d);
     slice identifier = identify(&scratch, d_method);
-    if (hash_table_lookup(&poisoned, identifier.chars, identifier.len)) {
-      result = mark_ambiguous(result);
+    if (d == s && !hash_table_lookup(&poisoned, identifier.chars, identifier.len)) {
+      result = d; // every superinterface agrees
+    } else {
+      // Superinterfaces disagree. "Concrete beats abstract" or "first one seen" is not the rule: a
+      // subinterface's redeclaration hides its parent's, and only two unrelated concrete methods are
+      // ambiguous (kotlinc's type-system contexts inherit defaults through such diamonds)
+      result = select_maximally_specific(classdesc, super, d_method);
     }
 
     // Then check to see if the class or a superclass has a matching method
@@ -179,7 +233,7 @@ static void setup_itables(classdesc *super, classdesc *cd) {
       *merge_with = copy_itable(super_itable);
 
     merge:
-      merge_itable(merge_with, super_itable, ambiguous, cd);
+      merge_itable(merge_with, super_itable, ambiguous, super, cd);
     }
   }
 

@@ -9,11 +9,28 @@
 DECLARE_NATIVE("sun/management", VMManagementImpl, getVersion0, "()Ljava/lang/String;") {
   return (stack_value){.obj = (void *)MakeJStringFromCString(thread, "23", true)};
 }
-DECLARE_NATIVE("sun/management", VMManagementImpl, initOptionalSupportFields, "()V") { return value_null(); }
+// 有効かどうかは setThreadCpuTimeEnabled0 で切り替わる（ThreadImpl.c）
+bool thread_cpu_time_enabled = false;
+
+// スレッドの CPU 時間だけは「対応している」と答える。kotlinc の PerformanceManager は
+// HotSpot 前提で条件なしに setThreadCpuTimeEnabled(true) を呼び、非対応だと
+// UnsupportedOperationException で落ちる。値は ThreadImpl.c が単調時計で返す
+DECLARE_NATIVE("sun/management", VMManagementImpl, initOptionalSupportFields, "()V") {
+  classdesc *cd = bootstrap_lookup_class(thread, STR("sun/management/VMManagementImpl"));
+  const char *supported[] = {"currentThreadCpuTimeSupport", "otherThreadCpuTimeSupport"};
+  for (size_t i = 0; i < sizeof(supported) / sizeof(supported[0]); ++i) {
+    cp_field *field = field_lookup(cd, (slice){.chars = (char *)supported[i], .len = strlen(supported[i])}, STR("Z"));
+    if (field)
+      *(u8 *)((u8 *)cd->static_fields + field->byte_offset) = 1;
+  }
+  return value_null();
+}
 DECLARE_NATIVE("sun/management", VMManagementImpl, isThreadContentionMonitoringEnabled, "()Z") {
   return (stack_value){.i = 0};
 }
-DECLARE_NATIVE("sun/management", VMManagementImpl, isThreadCpuTimeEnabled, "()Z") { return (stack_value){.i = 0}; }
+DECLARE_NATIVE("sun/management", VMManagementImpl, isThreadCpuTimeEnabled, "()Z") {
+  return (stack_value){.i = thread_cpu_time_enabled};
+}
 DECLARE_NATIVE("sun/management", VMManagementImpl, isThreadAllocatedMemoryEnabled, "()Z") {
   return (stack_value){.i = 0};
 }

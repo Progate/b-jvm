@@ -65,7 +65,15 @@ DECLARE_NATIVE("java/lang", Throwable, fillInStackTrace, "(I)Ljava/lang/Throwabl
     if (!o)
       goto oom;
     E->declaringClassObject = o;
-    o = MakeJStringFromModifiedUTF8(thread, method->my_class->name, true);
+    // HotSpot と同じく binary name（ドット区切り）にする。kotlin.jvm.internal.Intrinsics は
+    // getStackTrace() の中から自分を getClassName() の一致で探すので、スラッシュのままだと
+    // 見つからずに配列の外まで走る
+    heap_string binary_name = make_heap_str_from(method->my_class->name);
+    for (u32 k = 0; k < binary_name.len; ++k)
+      if (binary_name.chars[k] == '/')
+        binary_name.chars[k] = '.';
+    o = MakeJStringFromModifiedUTF8(thread, hslc(binary_name), true);
+    free_heap_str(binary_name);
     if (!o)
       goto oom;
     E->declaringClass = o;
@@ -74,6 +82,7 @@ DECLARE_NATIVE("java/lang", Throwable, fillInStackTrace, "(I)Ljava/lang/Throwabl
       goto oom;
     E->methodName = o;
     attribute_source_file *sf = method->my_class->source_file;
+    o = nullptr; // SourceFile 属性が無ければ fileName は null（メソッド名を使い回さない）
     if (sf) {
       o = MakeJStringFromModifiedUTF8(thread, sf->name, true);
       if (!o)

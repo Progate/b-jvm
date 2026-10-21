@@ -230,7 +230,8 @@ DECLARE_ASYNC(stack_value, run_native,
 
 DECLARE_ASYNC(
     int, initialize_class,
-    locals(initialize_class_t *recursive_call_space; char wakeup_info[SCHEDULER_WAKEUP_INFO_SIZE]; u16 i),
+    locals(initialize_class_t *recursive_call_space; char wakeup_info[SCHEDULER_WAKEUP_INFO_SIZE]; u16 i;
+           classdesc **interfaces_to_init),
     arguments(vm_thread *thread; classdesc *classdesc),
     invoked_methods(
         invoked_method(call_interpreter)

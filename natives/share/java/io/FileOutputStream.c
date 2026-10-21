@@ -1,7 +1,35 @@
+#include <errno.h>
 #include <natives-dsl.h>
+#ifdef EMSCRIPTEN
+#include <fcntl.h>
+#else
+#include <sys/fcntl.h>
+#endif
 #include <unistd.h>
 
 DECLARE_NATIVE("java/io", FileOutputStream, initIDs, "()V") { return value_null(); }
+
+// new FileOutputStream(path[, append])。kotlinc が .class を書き出すのはここを通る
+DECLARE_NATIVE("java/io", FileOutputStream, open0, "(Ljava/lang/String;Z)V") {
+  if (!args[0].handle->obj)
+    return value_null();
+  heap_string filename = AsHeapString(args[0].handle->obj, on_oom);
+
+  int flags = O_WRONLY | O_CREAT | (args[1].i ? O_APPEND : O_TRUNC);
+  s32 unix_fd = open(filename.chars, flags, 0666);
+  obj_header *fd = LoadFieldObject(obj->obj, "java/io/FileDescriptor", "fd");
+  DCHECK(fd);
+  StoreFieldInt(fd, "fd", unix_fd);
+  if (unix_fd < 0) {
+    INIT_STACK_STRING(msg, 1024);
+    msg = bprintf(msg, "%.*s (%s)", fmt_slice(filename), strerror(errno));
+    raise_vm_exception(thread, STR("java/io/FileNotFoundException"), msg);
+  }
+  free_heap_str(filename);
+
+on_oom:
+  return value_null();
+}
 
 DECLARE_NATIVE("java/io", FileOutputStream, writeBytes, "([BIIZ)V") {
   obj_header *fd = LoadFieldObject(obj->obj, "java/io/FileDescriptor", "fd");

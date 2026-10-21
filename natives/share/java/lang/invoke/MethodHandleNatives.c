@@ -130,6 +130,10 @@ DEFINE_ASYNC(resolve_mn) {
   link_class(args->thread, search_on);
 
   method_handle_kind kind = unpack_mn_kind(M); // TODO validate
+  // 見つからなかったときは元の印（MN_IS_METHOD など）へ戻す。JDK の
+  // MemberName.makeAccessException はこの印で NoSuchMethodException と
+  // NoSuchFieldException を選ぶ
+  int original_flags = M->flags;
   M->flags &= (int)0xFF000000U;
   bool dynamic_dispatch, found = false;
 
@@ -166,6 +170,8 @@ DEFINE_ASYNC(resolve_mn) {
   }
 
   free_heap_str(self->search_for);
+  if (!found)
+    M->flags = original_flags;
   ASYNC_RETURN(found ? METHOD_RESOLVE_OK : METHOD_RESOLVE_NOT_FOUND);
 
 on_oom:
@@ -209,7 +215,16 @@ DECLARE_ASYNC_NATIVE("java/lang/invoke", MethodHandleNatives, resolve,
   }
 
   if (unlikely(found == METHOD_RESOLVE_NOT_FOUND)) {
-    raise_vm_exception(thread, STR("java/lang/LinkageError"), STR("Failed to resolve MemberName"));
+    // HotSpot と同じく、投機的な解決（speculativeResolve）なら例外を出さず null を返す。
+    // そうでなければ NoSuchMethodError / NoSuchFieldError にする。素の LinkageError だと
+    // MemberName.makeAccessException が IllegalAccessException を選んでしまい、
+    // @CallerSensitive のアダプター探し（無ければ NoSuchMethodException を受けて次へ進む）が
+    // InternalError で落ちる（kotlin-reflect が Method.invoke する Class.getRecordComponents）
+    if (args[3].i)
+      ASYNC_RETURN(value_null());
+    bool is_field = ((struct native_MemberName *)self->mn->obj)->flags & MN_IS_FIELD;
+    raise_vm_exception(thread, is_field ? STR("java/lang/NoSuchFieldError") : STR("java/lang/NoSuchMethodError"),
+                       STR("Failed to resolve MemberName"));
     ASYNC_RETURN(value_null());
   }
 

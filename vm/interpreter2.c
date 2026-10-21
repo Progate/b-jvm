@@ -696,9 +696,7 @@ DEFINE_ASYNC(resolve_getstatic_putstatic) {
   if (resolve_class(thread, self->class))
     ASYNC_RETURN(-1);
 
-  // Then, attempt to initialize the class.
-  AWAIT(initialize_class, thread, self->class->classdesc);
-  if (thread->current_exception)
+  if (link_class(thread, self->class->classdesc))
     ASYNC_RETURN(-1);
 
 #define field self->field_info->field
@@ -714,6 +712,13 @@ DEFINE_ASYNC(resolve_getstatic_putstatic) {
     raise_incompatible_class_change_error(thread, complaint);
     ASYNC_RETURN(-1);
   }
+
+  // JVMS §6.5 getstatic: "On successful resolution of the field, the class or interface that declared the
+  // resolved field is initialized". The referenced class may only inherit the field from a superinterface,
+  // and initializing a class does not initialize such interfaces (§5.5)
+  AWAIT(initialize_class, thread, field->my_class);
+  if (thread->current_exception)
+    ASYNC_RETURN(-1);
 
   // Select the appropriate resolved instruction kind.
   bool putstatic = inst->kind == insn_putstatic;
@@ -2723,8 +2728,8 @@ __attribute__((always_inline)) static s64 entry_notco_impl(vm_thread *thread, st
     case 0:
     case RETVAL_EXCEPTION_THROWN:
     case RETVAL_FUEL_CHECK:
-    case RETVAL_ASYNC_SUSPEND: // special value in case of exception or suspend or invoke (theoretically also
-                               // nop_impl_void, but javac doesn't use that)
+    case RETVAL_ASYNC_SUSPEND: // special value in case of exception or suspend or invoke (0 is
+                               // insn_reserved_zero, so no handler returns it as a dispatch code)
       return handler_i;
     default: {
       // outlined case
