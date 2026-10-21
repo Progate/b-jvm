@@ -646,7 +646,6 @@ vm *create_vm(const vm_options options) {
   // java.io.tmpdir=/tmp に依存するコード（Tomcat の一時ディレクトリ等）のため
   // 最低限のディレクトリだけ先に作る
   (void)mkdir("/tmp", 0777);
-  (void)mkdir("/bjvm-resources", 0777);
 
   vm->application_classpath = make_heap_str_from(options.classpath);
   vm->exit_status = -1; // "System.exit has not been called"
@@ -1534,6 +1533,9 @@ classdesc *define_class(vm_thread *thread, classloader *cl, slice chars, const u
     done:
     }
   }
+
+  for (int j = 0; j < class->methods_count; ++j)
+    class->methods[j].call_intrinsic = find_call_intrinsic(class->name, class->methods + j);
 
   class->kind = CD_KIND_ORDINARY;
   class->classloader = cl;

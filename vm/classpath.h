@@ -71,7 +71,7 @@ int lookup_classpath_idx(classpath *cp, slice filename, u8 **bytes, size_t *len,
 // ディレクトリエントリでは存在確認した実パスを、jar エントリでは out_dir 配下に
 // 展開したファイルのパスを返す。戻り値は heap_string の stb 配列（呼び出し側が
 // arrfree + free_heap_str で解放する）。見つからなければ空配列
-heap_string *classpath_find_resources(classpath *cp, slice filename, const char *out_dir);
+heap_string *classpath_find_resources(classpath *cp, slice filename);
 
 #ifdef __cplusplus
 }

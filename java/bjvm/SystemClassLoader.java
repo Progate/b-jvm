@@ -15,9 +15,8 @@ import java.util.List;
  *
  * クラスの読み込み自体は bootstrap に任せたまま、アプリケーションのクラスパス
  * から読まれたクラスの getClassLoader() がこのローダを返す。getResource(s) 系は
- * VM がリソースを実ファイルとして見せる仕組み（findResources0 ネイティブが
- * 実パスの一覧を返す）に載せているので、META-INF/spring.factories のような
- * jar 内リソースも通常の file: URL として読める。
+ * 本物の AppClassLoader と同じく、jar の中のものを jar: URL、ディレクトリのものを
+ * file: URL で返す（META-INF/spring.factories のような jar 内リソースも JarURLConnection で読める）。
  */
 public final class SystemClassLoader extends ClassLoader {
   /**
@@ -50,23 +49,36 @@ public final class SystemClassLoader extends ClassLoader {
     return Class.forName(name, resolve, null);
   }
 
+  /**
+   * findResources0 が返す在りかを URL にする。jar の中のものは `jar:<jar の絶対パス>!/<名前>` で来るので、
+   * 本物の AppClassLoader と同じ `jar:file:/…/x.jar!/<名前>` に組む（jar のパスは toURI で符号化する）
+   */
+  private static URL toUrl(String location) throws MalformedURLException {
+    if (location.startsWith("jar:")) {
+      int separator = location.indexOf("!/");
+      String jar = location.substring("jar:".length(), separator);
+      return new URL("jar:" + new File(jar).toURI() + location.substring(separator));
+    }
+    return new File(location).toURI().toURL();
+  }
+
   @Override
   public Enumeration<URL> getResources(String name) throws IOException {
     List<URL> urls = new ArrayList<>();
-    for (String path : findResources0(name)) {
-      urls.add(new File(path).toURI().toURL());
+    for (String location : findResources0(name)) {
+      urls.add(toUrl(location));
     }
     return Collections.enumeration(urls);
   }
 
   @Override
   public URL getResource(String name) {
-    String[] paths = findResources0(name);
-    if (paths.length == 0) {
+    String[] locations = findResources0(name);
+    if (locations.length == 0) {
       return null;
     }
     try {
-      return new File(paths[0]).toURI().toURL();
+      return toUrl(locations[0]);
     } catch (MalformedURLException e) {
       return null;
     }

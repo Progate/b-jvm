@@ -17,45 +17,28 @@ static bool is_frame_part_of_throwable_construction(stack_frame *frame, object o
 // Implementation-dependent field where we can store the stack trace
 obj_header **backtrace_object(obj_header *throwable) { return &((struct native_Throwable *)throwable)->backtrace; }
 
-DECLARE_NATIVE("java/lang", Throwable, fillInStackTrace, "(I)Ljava/lang/Throwable;") {
-  // Called in the constructor of Throwable. We therefore need to ignore
-  // frames which are constructing the current object, which we can do by
-  // inspecting the stack.
+/**
+ * `frame` から根元までの `n_frames` 枚を StackTraceElement[] にする。配列を確保できなければ nullptr
+ * （例外は保留されている）。要素の確保に途中で失敗したら、そこまで埋めた配列を返す。
+ * 例外の fillInStackTrace と、ほかのスレッドの Thread.getStackTrace（getStackTrace0）が使う
+ */
+static object build_stack_trace(vm_thread *thread, stack_frame *frame, int n_frames) {
   classdesc *StackTraceElement = cached_classes(thread->vm)->stack_trace_element;
-
-  // Find the first frame which is not an initializer of the current exception
-  stack_frame *frame = thread->stack.top;
-  while (frame) {
-    if (!is_frame_part_of_throwable_construction(frame, obj->obj)) {
-      break;
-    }
-    frame = frame->prev;
-  }
-
-  // Count frames until base
-  stack_frame *tmp = frame;
-  int n_frames = 0;
-  while (tmp) {
-    tmp = tmp->prev;
-    ++n_frames;
-  }
-
-  // Now n_frames is the number of frames in [ frame, frame->prev, ..., first frame ]
-
-  // Create stack trace of the appropriate height
   handle *stack_trace = make_handle(thread, CreateObjectArray1D(thread, StackTraceElement, n_frames));
-  if (!stack_trace->obj) // Failed to allocate
-    return value_null();
-
-  ((struct native_Throwable *)obj->obj)->depth = n_frames;
+  if (!stack_trace->obj) { // Failed to allocate
+    drop_handle(thread, stack_trace);
+    return nullptr;
+  }
 
   for (int j = 0; n_frames > 0; --n_frames, ++j) {
     DCHECK(frame);
 
     // Create the stack trace element
     handle *e = make_handle(thread, new_object(thread, StackTraceElement));
-    if (!e->obj) // Failed to allocate StackTraceElement
-      goto cleanup;
+    if (!e->obj) { // Failed to allocate StackTraceElement
+      drop_handle(thread, e);
+      break;
+    }
 
     cp_method *method = frame->method;
 
@@ -92,21 +75,67 @@ DECLARE_NATIVE("java/lang", Throwable, fillInStackTrace, "(I)Ljava/lang/Throwabl
     E->fileName = o;
     E->lineNumber = line;
     *((void **)ArrayData(stack_trace->obj) + j) = e->obj;
-
-#if 0
-    fprintf(stderr, "Stack trace element %d: %.*s.%.*s (%s:%d)\n", j, fmt_slice(method->my_class->name), fmt_slice(method->name),
-            sf ? sf->name.chars : "unknown", line);
-#endif
 #undef E
     drop_handle(thread, e);
     frame = frame->prev;
+    continue;
+  oom:
+    drop_handle(thread, e);
+    break;
   }
 
-cleanup:
-  *backtrace_object(obj->obj) = stack_trace->obj;
-oom:
+  object result = stack_trace->obj;
   drop_handle(thread, stack_trace);
+  return result;
+}
+
+static int count_frames(stack_frame *frame) {
+  int n_frames = 0;
+  for (; frame; frame = frame->prev)
+    ++n_frames;
+  return n_frames;
+}
+
+DECLARE_NATIVE("java/lang", Throwable, fillInStackTrace, "(I)Ljava/lang/Throwable;") {
+  // Called in the constructor of Throwable. We therefore need to ignore
+  // frames which are constructing the current object, which we can do by
+  // inspecting the stack.
+  stack_frame *frame = thread->stack.top;
+  while (frame) {
+    if (!is_frame_part_of_throwable_construction(frame, obj->obj)) {
+      break;
+    }
+    frame = frame->prev;
+  }
+
+  int n_frames = count_frames(frame);
+  object stack_trace = build_stack_trace(thread, frame, n_frames);
+  if (stack_trace) {
+    ((struct native_Throwable *)obj->obj)->depth = n_frames;
+    *backtrace_object(obj->obj) = stack_trace;
+  }
   return (stack_value){.obj = obj->obj};
+}
+
+/**
+ * ほかのスレッドのスタック（`Thread.getStackTrace()`）。スレッドダンプや、JUnit のタイムアウトの報告、
+ * 走っているプログラムを外から覗くサンプラーが使う。走っていないスレッドなら null（JDK が空の配列にする）。
+ *
+ * b-jvm のスレッドは 1 つの wasm スレッドの上で順に回るので、ほかのスレッドは必ず止まった点（譲った点）
+ * にいて、そのフレームはそのまま読める
+ */
+DECLARE_NATIVE("java/lang", Thread, getStackTrace0, "()Ljava/lang/Object;") {
+  vm_thread *target = nullptr;
+  for (int i = 0; i < arrlen(thread->vm->active_threads); ++i) {
+    if ((object)thread->vm->active_threads[i]->thread_obj == obj->obj) {
+      target = thread->vm->active_threads[i];
+      break;
+    }
+  }
+  if (!target)
+    return value_null();
+  stack_frame *frame = target->stack.top;
+  return (stack_value){.obj = build_stack_trace(thread, frame, count_frames(frame))};
 }
 
 DECLARE_NATIVE("java/lang", Throwable, getStackTraceDepth, "()I") {

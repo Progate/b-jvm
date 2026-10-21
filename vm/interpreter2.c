@@ -58,6 +58,7 @@
 #include "bjvm.h"
 #include "classfile.h"
 #include "dumb_jit.h"
+#include "jit.h"
 #include "util.h"
 #include "wasm_trampolines.h"
 
@@ -1802,12 +1803,298 @@ void attempt_jit(cp_method *method) {
     method->call_count += 15;                                                                                          \
   }
 
+/** Call-site intrinsics: small pure library methods run inline instead of pushing a frame.
+ *
+ * kotlinc spends most of its time in tiny calls (Intrinsics.checkNotNullParameter on every parameter, String.equals
+ * through areEqual), where the frame push and return cost far more than the body. Each intrinsic either handles the
+ * call completely or declines, and a declined call (e.g. a null that must throw) goes through the normal invoke. */
+
+static bool is_return_insn(insn_code_kind kind) {
+  return kind == insn_ireturn || kind == insn_lreturn || kind == insn_areturn || kind == insn_freturn ||
+         kind == insn_dreturn;
+}
+
+u8 find_call_intrinsic(slice class_name, const cp_method *method) {
+  if (method->access_flags & (ACCESS_NATIVE | ACCESS_ABSTRACT))
+    return CALL_INTRINSIC_NONE;
+  slice name = method->name, desc = method->unparsed_descriptor;
+  if (utf8_equals(class_name, "kotlin/jvm/internal/Intrinsics")) {
+    bool null_check = utf8_equals(name, "checkNotNull") || utf8_equals(name, "checkNotNullParameter") ||
+                      utf8_equals(name, "checkNotNullExpressionValue") || utf8_equals(name, "checkParameterIsNotNull") ||
+                      utf8_equals(name, "checkExpressionValueIsNotNull");
+    if (null_check &&
+        (utf8_equals(desc, "(Ljava/lang/Object;)V") || utf8_equals(desc, "(Ljava/lang/Object;Ljava/lang/String;)V")))
+      return CALL_INTRINSIC_CHECK_NOT_NULL;
+    if (utf8_equals(name, "areEqual") && utf8_equals(desc, "(Ljava/lang/Object;Ljava/lang/Object;)Z"))
+      return CALL_INTRINSIC_ARE_EQUAL;
+  } else if (utf8_equals(class_name, "java/lang/String")) {
+    if (utf8_equals(name, "equals") && utf8_equals(desc, "(Ljava/lang/Object;)Z"))
+      return CALL_INTRINSIC_STRING_EQUALS;
+  } else if (utf8_equals(class_name, "jdk/internal/util/Preconditions")) {
+    if (utf8_equals(name, "checkIndex") && utf8_equals(desc, "(IILjava/util/function/BiFunction;)I"))
+      return CALL_INTRINSIC_CHECK_INDEX;
+  } else if (utf8_equals(class_name, "java/util/ArrayList$Itr")) {
+    if (utf8_equals(name, "hasNext") && utf8_equals(desc, "()Z"))
+      return CALL_INTRINSIC_ITR_HAS_NEXT;
+    if (utf8_equals(name, "checkForComodification") && utf8_equals(desc, "()V"))
+      return CALL_INTRINSIC_ITR_CHECK_MOD;
+  }
+  // A plain getter: the body is `aload_0; getfield; xreturn`. Kotlin compiles every property read to one
+  attribute_code *code = method->code;
+  if (!(method->access_flags & (ACCESS_STATIC | ACCESS_SYNCHRONIZED)) && code && code->insn_count == 3 && code->code[0].kind == insn_aload &&
+      code->code[0].index == 0 && code->code[1].kind == insn_getfield && is_return_insn(code->code[2].kind))
+    return CALL_INTRINSIC_GETTER;
+  return CALL_INTRINSIC_NONE;
+}
+
+// A getter whose getfield has been resolved (the interpreter rewrites the instruction on its first run, which the
+// declined calls do). Reads the field the same way the getfield_X handlers do
+static bool run_getter(const cp_method *method, obj_header *receiver, stack_value *result) {
+  const bytecode_insn *getfield = &method->code->code[1];
+  if (!receiver)
+    return false;
+  char *field = (char *)receiver + (size_t)getfield->ic2;
+  *result = (stack_value){.l = 0};
+  switch (getfield->kind) {
+  case insn_getfield_B:
+  case insn_getfield_Z:
+    result->l = *(s8 *)field;
+    return true;
+  case insn_getfield_C:
+    result->l = *(u16 *)field;
+    return true;
+  case insn_getfield_S:
+    result->l = *(s16 *)field;
+    return true;
+  case insn_getfield_I:
+    result->l = *(int *)field;
+    return true;
+  case insn_getfield_J:
+    result->l = *(s64 *)field;
+    return true;
+  case insn_getfield_F:
+    result->f = *(float *)field;
+    return true;
+  case insn_getfield_D:
+    result->d = *(double *)field;
+    return true;
+  case insn_getfield_L:
+    result->obj = *(obj_header **)field;
+    return true;
+  default:
+    return false; // not resolved yet
+  }
+}
+
+// Field offsets of ArrayList$Itr and ArrayList, looked up on first use
+static struct {
+  bool ready;
+  size_t cursor, expected_mod_count, outer, size, mod_count;
+} itr_fields;
+
+static bool load_itr_fields(obj_header *itr) {
+  if (itr_fields.ready)
+    return true;
+  cp_field *cursor = field_lookup(itr->descriptor, STR("cursor"), STR("I"));
+  cp_field *expected = field_lookup(itr->descriptor, STR("expectedModCount"), STR("I"));
+  cp_field *outer = field_lookup(itr->descriptor, STR("this$0"), STR("Ljava/util/ArrayList;"));
+  if (!cursor || !expected || !outer)
+    return false;
+  obj_header *list = *(obj_header **)((char *)itr + outer->byte_offset);
+  if (!list)
+    return false;
+  cp_field *size = field_lookup(list->descriptor, STR("size"), STR("I"));
+  cp_field *mod_count = field_lookup(list->descriptor, STR("modCount"), STR("I"));
+  if (!size || !mod_count)
+    return false;
+  itr_fields.cursor = cursor->byte_offset;
+  itr_fields.expected_mod_count = expected->byte_offset;
+  itr_fields.outer = outer->byte_offset;
+  itr_fields.size = size->byte_offset;
+  itr_fields.mod_count = mod_count->byte_offset;
+  itr_fields.ready = true;
+  return true;
+}
+
+#define ITR_INT(obj, offset) (*(int *)((char *)(obj) + (offset)))
+
+// Same as String.equals for two non-null strings (the coders match whenever the contents do, as in String.equals)
+static bool java_strings_equal(obj_header *a, obj_header *b) {
+  struct native_String *x = (void *)a, *y = (void *)b;
+  if (x->coder != y->coder)
+    return false;
+  int len = ArrayLength(x->value);
+  return len == ArrayLength(y->value) && memcmp(ArrayData(x->value), ArrayData(y->value), len) == 0;
+}
+
+// Returns whether the intrinsic handled the call; if so, *result holds the return value (when there is one)
+static bool run_call_intrinsic(vm_thread *thread, const cp_method *method, stack_value *args, stack_value *result) {
+  switch (method->call_intrinsic) {
+  case CALL_INTRINSIC_CHECK_NOT_NULL:
+    return args[0].obj != nullptr;
+  case CALL_INTRINSIC_ARE_EQUAL: {
+    obj_header *a = args[0].obj, *b = args[1].obj;
+    if (a == b || !a) {
+      result->l = a == b;
+      return true;
+    }
+    // Before the cached classdescs exist (early boot), leave it to the real method
+    struct cached_classdescs *cached = thread->vm->_cached_classdescs;
+    if (!cached || a->descriptor != cached->string)
+      return false; // a user-defined equals
+    classdesc *string = cached->string;
+    result->l = b && b->descriptor == string && java_strings_equal(a, b);
+    return true;
+  }
+  case CALL_INTRINSIC_STRING_EQUALS: {
+    obj_header *a = args[0].obj, *b = args[1].obj;
+    // The receiver is a String (String is final), so b is one exactly when its class is the receiver's
+    result->l = a == b || (b && b->descriptor == a->descriptor && java_strings_equal(a, b));
+    return true;
+  }
+  case CALL_INTRINSIC_GETTER:
+    return run_getter(method, args[0].obj, result);
+  case CALL_INTRINSIC_CHECK_INDEX: {
+    s32 index = args[0].i, length = args[1].i;
+    if (index < 0 || index >= length)
+      return false; // the real method builds the exception
+    result->l = index;
+    return true;
+  }
+  case CALL_INTRINSIC_ITR_HAS_NEXT: {
+    obj_header *itr = args[0].obj;
+    if (!itr || !load_itr_fields(itr))
+      return false;
+    obj_header *list = *(obj_header **)((char *)itr + itr_fields.outer);
+    if (!list)
+      return false;
+    result->l = ITR_INT(itr, itr_fields.cursor) != ITR_INT(list, itr_fields.size);
+    return true;
+  }
+  case CALL_INTRINSIC_ITR_CHECK_MOD: {
+    obj_header *itr = args[0].obj;
+    if (!itr || !load_itr_fields(itr))
+      return false;
+    obj_header *list = *(obj_header **)((char *)itr + itr_fields.outer);
+    // A modified list must throw ConcurrentModificationException: leave that to the real method
+    return list && ITR_INT(list, itr_fields.mod_count) == ITR_INT(itr, itr_fields.expected_mod_count);
+  }
+  default:
+    return false;
+  }
+}
+
+// Expects sp, insn and the spilled stack to be in scope. Falls through when the method has no intrinsic or it declined
+#define TRY_CALL_INTRINSIC(method)                                                                                     \
+  if (unlikely((method)->call_intrinsic)) {                                                                            \
+    stack_value intrinsic_result;                                                                                      \
+    if (run_call_intrinsic(thread, (method), sp - insn->args, &intrinsic_result)) {                    \
+      sp -= insn->args;                                                                                                \
+      if (insn->returns)                                                                                               \
+        *sp++ = intrinsic_result;                                                                                      \
+      STACK_POLYMORPHIC_NEXT(*(sp - 1));                                                                               \
+    }                                                                                                                  \
+  }
+
+// Compiled code (jit.c) calling one of the invoke instructions. Mirrors the handlers below: same target, same
+// intrinsics. A compiled callee is called directly (nested at most JIT_MAX_NESTING deep, to bound the host stack);
+// anything else is left to the driver, which continues the pushed frame or executes the instruction.
+int jit_nesting;
+
+__attribute__((noinline, used)) int jit_rt_invoke(vm_thread *thread, stack_frame *frame, int insn_index) {
+  bytecode_insn *call = frame->code + insn_index;
+  stack_value *args = frame->stack + frame->insn_index_to_sd[insn_index] - call->args;
+  cp_method *method;
+  switch (call->kind) {
+  case insn_invokestatic_resolved:
+    method = call->ic;
+    if (method->is_signature_polymorphic)
+      return JIT_INVOKE_INTERPRET;
+    break;
+  case insn_invokespecial_resolved:
+    method = call->ic;
+    goto receiver;
+  case insn_invokevtable_monomorphic:
+  case insn_invokeitable_monomorphic:
+    if (args[0].obj && args[0].obj->descriptor != call->ic2)
+      return JIT_INVOKE_INTERPRET; // the interpreter turns the cache polymorphic
+    method = call->ic;
+    goto receiver;
+  case insn_invokevtable_polymorphic:
+    if (!args[0].obj)
+      goto npe;
+    method = vtable_lookup(args[0].obj->descriptor, (size_t)call->ic2);
+    break;
+  case insn_invokeitable_polymorphic:
+    if (!args[0].obj)
+      goto npe;
+    method = itable_lookup(args[0].obj->descriptor, call->ic, (size_t)call->ic2);
+    if (!method)
+      return JIT_INVOKE_INTERPRET; // AbstractMethodError
+    break;
+  default:
+    return JIT_INVOKE_INTERPRET; // not resolved yet, invokedynamic...
+  receiver:
+    if (!args[0].obj)
+      goto npe;
+    break;
+  }
+
+  if (unlikely(method->call_intrinsic)) {
+    stack_value result;
+    if (run_call_intrinsic(thread, method, args, &result)) {
+      if (call->returns)
+        args[0] = result;
+      return JIT_INVOKE_DONE;
+    }
+  }
+  // A native that completes synchronously runs right here, in its own native frame as the driver would run it
+  if ((method->access_flags & (ACCESS_NATIVE | ACCESS_SYNCHRONIZED)) == ACCESS_NATIVE && method->native_handle &&
+      !((native_callback *)method->native_handle)->async_ctx_bytes) {
+    stack_frame *native_frame = push_native_frame(thread, method, method->descriptor, args, call->args);
+    if (!native_frame)
+      return JIT_INVOKE_EXCEPTION;
+    run_native_t native = {.args = {.thread = thread, .frame = native_frame}};
+    [[maybe_unused]] future_t fut = run_native(&native);
+    DCHECK(fut.status == FUTURE_READY);
+    pop_frame(thread, native_frame);
+    if (thread->current_exception)
+      return JIT_INVOKE_EXCEPTION;
+    if (call->returns)
+      args[0] = native._result;
+    return JIT_INVOKE_DONE;
+  }
+  // Async natives and synchronized methods go through the driver (on_frame_start / on_frame_end)
+  if (!method->code || method->access_flags & (ACCESS_NATIVE | ACCESS_SYNCHRONIZED))
+    return JIT_INVOKE_INTERPRET;
+  stack_frame *callee = push_plain_frame(thread, method, args, call->args);
+  if (!callee)
+    return JIT_INVOKE_EXCEPTION; // StackOverflowError
+  if (jit_nesting >= JIT_MAX_NESTING)
+    return JIT_INVOKE_PENDING;
+  jit_nesting++;
+  int status = jit_try_run(thread, callee);
+  jit_nesting--;
+  if (status != JIT_STATUS_RETURN)
+    return JIT_INVOKE_PENDING; // not compiled, bailed out or threw: the frame is the driver's now
+  stack_value result = callee->stack[0];
+  pop_frame(thread, callee);
+  if (call->returns)
+    args[0] = result;
+  return JIT_INVOKE_DONE;
+
+npe:
+  raise_null_pointer_exception(thread);
+  return JIT_INVOKE_EXCEPTION;
+}
+
 static s64 invokestatic_resolved_impl_void(ARGS_VOID) {
   DEBUG_CHECK();
   cp_method *method = insn->ic;
   bool returns = insn->returns;
   stack_frame *invoked_frame;
   SPILL_VOID
+  TRY_CALL_INTRINSIC(method)
   if (method->is_signature_polymorphic) {
     invoked_frame = push_native_frame(thread, method, insn->cp->methodref.descriptor, sp - insn->args, insn->args);
   } else {
@@ -1955,6 +2242,7 @@ static s64 invokespecial_resolved_impl_void(ARGS_VOID) {
   NPE_ON_NULL(receiver);
 
   cp_method *receiver_method = insn->ic;
+  TRY_CALL_INTRINSIC(receiver_method)
   ConsiderJitEntry(thread, receiver_method, sp - insn->args);
 
   stack_frame *invoked_frame = push_frame(thread, receiver_method, sp - insn->args, insn->args);
@@ -2045,6 +2333,7 @@ static s64 invokeitable_vtable_monomorphic_impl_void(ARGS_VOID) {
       make_invokeitable_polymorphic_(insn);
     JMP_VOID
   }
+  TRY_CALL_INTRINSIC((cp_method *)insn->ic)
 
   ConsiderJitEntry(thread, ((cp_method *)insn->ic), sp - insn->args);
   stack_frame *invoked_frame = push_frame(thread, insn->ic, sp - insn->args, insn->args);
@@ -2098,6 +2387,7 @@ static s64 invokeitable_polymorphic_impl_void(ARGS_VOID) {
     return RETVAL_EXCEPTION_THROWN;
   }
   DCHECK(receiver_method);
+  TRY_CALL_INTRINSIC(receiver_method)
 
   ConsiderJitEntry(thread, receiver_method, sp - insn->args);
 
@@ -2117,6 +2407,7 @@ static s64 invokevtable_polymorphic_impl_void(ARGS_VOID) {
   NPE_ON_NULL(receiver);
   cp_method *receiver_method = vtable_lookup(receiver->descriptor, (size_t)insn->ic2);
   DCHECK(receiver_method);
+  TRY_CALL_INTRINSIC(receiver_method)
 
   ConsiderJitEntry(thread, receiver_method, sp - insn->args);
 
@@ -3074,6 +3365,20 @@ stack_value interpret_2(future_t *fut, vm_thread *thread, stack_frame *entry_fra
       }
     } else {
     java_interpret_begin:
+      // Compiled code (jit.c) runs the frame as far as it can; whatever is left continues in the interpreter
+      if (likely(!current_frame->is_async_suspended && !thread->current_exception && !thread->is_single_stepping)) {
+        int jit_status = jit_try_run(thread, current_frame);
+        if (jit_status == JIT_STATUS_RETURN) {
+          result = current_frame->stack[0];
+          goto jit_frame_end;
+        }
+        if (jit_status == JIT_STATUS_EXCEPTION)
+          goto find_exception_handler;
+        if (thread->stack.top != current_frame) { // a call the compiled code started: continue the callee
+          current_frame = thread->stack.top;
+          continue;
+        }
+      }
 
       /** Handle Java frames */
       s32 pc_ = current_frame->program_counter;
@@ -3114,6 +3419,7 @@ stack_value interpret_2(future_t *fut, vm_thread *thread, stack_frame *entry_fra
           bool preempting = refuel_check(thread);
           if (!preempting) {
             current_frame->is_async_suspended = false;
+            jit_note_hot_loop(current_frame);
             goto java_interpret_begin;
           }
         }
@@ -3147,6 +3453,7 @@ stack_value interpret_2(future_t *fut, vm_thread *thread, stack_frame *entry_fra
     }
 
     /** End frame logic */
+  jit_frame_end:
     on_frame_end(thread, current_frame);
     pop_frame(thread, current_frame);
     if (current_frame == entry_frame) { // done with this chain of interpreter frames

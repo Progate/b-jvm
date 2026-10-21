@@ -615,6 +615,8 @@ value *get_native_args(const stack_frame *frame); // same as locals, just called
 
 stack_value *frame_stack(stack_frame *frame);
 stack_value interpret_2(future_t *fut, vm_thread *thread, stack_frame *entry_frame);
+// Which call-site intrinsic (if any) the interpreter may use for this method. 0 = none
+u8 find_call_intrinsic(slice class_name, const cp_method *method);
 
 native_frame_data *get_native_frame_data(stack_frame *frame);
 

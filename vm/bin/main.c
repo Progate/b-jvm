@@ -2,6 +2,8 @@
 // Created by Cowpox on 12/10/24.
 //
 
+#include <stdlib.h>
+#include <unistd.h>
 #include "arrays.h"
 #include "cached_classdescs.h"
 #include "exceptions.h"
@@ -18,6 +20,14 @@
 
 EMSCRIPTEN_KEEPALIVE
 vm *ffi_create_vm(const char *classpath, size_t heap_size, write_bytes stdout_, write_bytes stderr_) {
+#ifdef __wasi__
+  // WASI preview1 に chdir の syscall は無く、cwd は wasi-libc が持つ。BrowserOS はシェルの cwd を
+  // PWD で渡すので、起動時にそこへ移る（→ browser-os の src/wasi/imports.ts）。移らないと Java の
+  // 相対パス（`new File("main.kt")`、kotlinc の引数）がすべて `/` 基準になる
+  const char *pwd = getenv("PWD");
+  if (pwd && *pwd)
+    (void)chdir(pwd);
+#endif
   vm_options options = default_vm_options();
   options.classpath = (slice){.chars = (char *)classpath, .len = (int)strlen(classpath)};
   options.heap_size = heap_size;
@@ -230,6 +240,11 @@ bool ffi_is_string(object obj) { return obj && utf8_equals(obj->descriptor->name
 
 // Status passed to System.exit since the last call (0-255), or -1 if there was none. Reading clears
 // it, so a host driving several calls in one VM does not see a stale status from an earlier one.
+// System.exit が呼ばれたか（記録を消さずに見る）。呼んだスレッドは halt0 の中で眠り続けるので、
+// ホストはこれを見て駆動ループを抜ける
+EMSCRIPTEN_KEEPALIVE
+int ffi_exit_requested(vm *vm) { return vm->exit_status >= 0; }
+
 EMSCRIPTEN_KEEPALIVE
 int ffi_take_exit_status(vm *vm) {
   int status = vm->exit_status;

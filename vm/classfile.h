@@ -776,6 +776,17 @@ typedef struct cp_method {
   bool is_ctor;
   // Whether the method is a <clinit> (class initialization method)
   bool is_clinit;
+  // A pure method the interpreter runs inline at the call site instead of pushing a frame (method_intrinsic in
+  // interpreter2.c). Set at class link time
+  u8 call_intrinsic;
+  // jit.c: how many times the method compiled to wasm has been recompiled, and how often its code handed control
+  // back for an instruction that was unresolved when it was compiled
+  u8 jit_compiles;
+  u16 jit_unresolved_bails;
+  // jit.c: the method compiled to wasm, as an index into the function table (0 = not yet, -1 = never)
+  s32 jit_function;
+  // jit.c: interpreter entries counted toward compiling the method
+  u32 jit_hotness;
   classdesc *my_class;
 
   // Index in the vtable, if applicable. Only set at class link time.

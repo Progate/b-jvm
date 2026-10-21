@@ -385,20 +385,10 @@ int lookup_classpath(classpath *cp, const slice filename, u8 **bytes, size_t *le
   return lookup_classpath_idx(cp, filename, bytes, len, nullptr);
 }
 
-// ネストしたディレクトリを mkdir -p で作る。失敗しても呼び出し側で fopen が
-// 失敗するだけなので、ここではエラーを握りつぶす
-static void mkdir_p(char *buf) {
-  for (char *p = buf + 1; *p; ++p) {
-    if (*p == '/') {
-      *p = '\0';
-      mkdir(buf, 0755);
-      *p = '/';
-    }
-  }
-  mkdir(buf, 0755);
-}
-
-heap_string *classpath_find_resources(classpath *cp, slice filename, const char *out_dir) {
+// リソースの在りかを返す。jar の中なら `jar:<jar の絶対パス>!/<名前>`（Java 側で jar: URL に組む）、
+// ディレクトリなら実ファイルのパス。本物の AppClassLoader と同じ jar: URL にしておくと、kotlinc のように
+// リソースの URL から自分の jar の場所を逆算するコードがそのまま動く
+heap_string *classpath_find_resources(classpath *cp, slice filename) {
   heap_string *result = nullptr;
   if (bad_filename(filename))
     return result;
@@ -406,33 +396,13 @@ heap_string *classpath_find_resources(classpath *cp, slice filename, const char 
   for (int i = 0; i < arrlen(cp->entries); ++i) {
     classpath_entry *entry = &cp->entries[i];
     if (entry->jar) {
-      u8 *bytes;
-      size_t len;
-      if (jar_lookup(entry->jar, filename, &bytes, &len) != FOUND)
+      if (!hash_table_lookup(&entry->jar->entries, filename.chars, (int)filename.len))
         continue;
-
-      // out_dir/<entry index>/<リソースパス> に展開して、それを file: で指せるようにする
-      INIT_STACK_STRING(out_path, 4096);
-      out_path = bprintf(out_path, "%s/jar%d/%.*s", out_dir, i, fmt_slice(filename));
-      // 既に展開済みなら書き直さない
-      FILE *existing = fopen(out_path.chars, "rb");
-      if (existing) {
-        fclose(existing);
-      } else {
-        // ディレクトリ部分を作って書き込む
-        heap_string dir = make_heap_str_from(out_path);
-        char *slash = strrchr(dir.chars, '/');
-        if (slash) *slash = '\0';
-        mkdir_p(dir.chars);
-        free_heap_str(dir);
-        FILE *f = fopen(out_path.chars, "wb");
-        if (f) {
-          fwrite(bytes, 1, len, f);
-          fclose(f);
-        }
-      }
-      free(bytes);
-      arrput(result, make_heap_str_from(out_path));
+      char absolute[PATH_MAX];
+      const char *jar_path = realpath(entry->name.chars, absolute) ? absolute : entry->name.chars;
+      INIT_STACK_STRING(location, 4096);
+      location = bprintf(location, "jar:%s!/%.*s", jar_path, fmt_slice(filename));
+      arrput(result, make_heap_str_from(location));
       continue;
     }
 

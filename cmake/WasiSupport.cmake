@@ -34,6 +34,10 @@ function(configure_wasi_reactor TARGET)
             # The host allocates the argument buffers it hands to ffi_*, so it needs the VM's allocator.
             -Wl,--export=malloc
             -Wl,--export=free
+            # jit.c: the host appends compiled functions to the function table (and the compiled code calls the
+            # runtime helpers through it)
+            -Wl,--export-table
+            -Wl,--growable-table
             # The interpreter recurses deeply; the wasi-sdk default of 64KB overflows immediately.
             -Wl,-z,stack-size=8388608
     )

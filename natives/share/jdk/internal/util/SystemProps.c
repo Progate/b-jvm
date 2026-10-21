@@ -121,11 +121,16 @@ DECLARE_NATIVE("jdk/internal/util", SystemProps_Raw, vmProperties, "()[Ljava/lan
   handle *props = make_string_array(thread, 6);
 
   SET_PROP(0, "java.home");
+  INIT_STACK_STRING(java_home, 1024);
+#ifdef __wasi__
+  // WASI 版は起動時に PWD へ chdir する（→ vm/bin/main.c）ので、cwd からは決めない。
+  // browser-java は JDK を必ず /jdk23 に置く（→ src/mount-paths.ts の JAVA_HOME）
+  java_home = bprintf(java_home, "/jdk23");
+#else
   char cwd[1024] = {0};
   CHECK(cwd == getcwd(cwd, 1024));
-
-  INIT_STACK_STRING(java_home, 1024);
   java_home = bprintf(java_home, "%s/jdk23", cwd);
+#endif
 
   SET_PROP(1, java_home.chars);
   SET_PROP(2, "java.class.path");
