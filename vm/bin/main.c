@@ -466,10 +466,14 @@ void ffi_set_preemption_frequency_usec(rr_scheduler *scheduler, double us) {
  * 生きている VM の下から libc の状態を崩してしまう）。`exit_group` は
  * WASIProcExit としてホストへ投げられ、wasm から制御が戻ったあとも
  * メモリ・関数表・global はそのまま残る。
+ *
+ * 引数は 2 つにする。clang は wasm で引数を取る main を `__main_argc_argv` という名前にするが、
+ * それは引数が 2 つのときだけで、`envp` まで取る 3 引数の main は `main` のまま出る。crt1 は
+ * `__main_argc_argv` か `__main_void` しか呼ばないので、3 引数にすると main が呼ばれず
+ * 「called undefined weak function __main_argc_argv」で起動が止まる
  */
-int main(int argc, char **argv, char **envp) {
+int main(int argc, char **argv) {
   (void)argc;
   (void)argv;
-  (void)envp;
   _Exit(0);
 }
