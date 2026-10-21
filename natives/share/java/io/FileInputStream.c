@@ -140,8 +140,8 @@ DECLARE_NATIVE("java/io", FileInputStream, available0, "()I") {
   } else {
     int err = ioctl(unix_fd, FIONREAD, &available);
     if (err < 0) {
-      // wasi-libc の wasm32-wasip2 は FIONREAD を実装しておらず ENOTSUP を返す
-      // （wasm32-wasip1 は成功するが常に 0 を返す）。通常ファイルであれば
+      // wasi-libc の preview2 系は FIONREAD を実装しておらず ENOTSUP を返す
+      // （preview1 は成功するが常に 0 を返す）。通常ファイルであれば
       // 「サイズ - 現在位置」が available と一致するので、そちらで代替する。
       // ここで例外にすると、クラスパスからリソースを読む処理がまるごと失敗する
       struct stat st;

@@ -454,4 +454,22 @@ void ffi_set_preemption_frequency_usec(rr_scheduler *scheduler, double us) {
   scheduler->preemption_us = us > (double)UINT64_MAX ? UINT64_MAX : (u64)us;
 }
 
-int main() {}
+/*
+ * -pie の入口。ローダー（browser-dyld）が libc.so とこのモジュールを instantiate したあと、
+ * ホストが `_start` を 1 度だけ呼ぶ。crt は `__libc_start_main` → `init_modules` で
+ * **全モジュールのコンストラクタ**を回してから `main` へ来るので、ここに来た時点で
+ * libc と b-jvm の静的初期化は済んでいる。
+ *
+ * main は「初期化が終わった」の印だけで、中身は無い。`_Exit` で止めるのは、
+ * 以後ホストが `ffi_*` を呼んで使い続けるプロセスイメージを壊さないためである
+ * （`return` や `exit` だと atexit とデストラクタ（`fini_modules`）が走り、
+ * 生きている VM の下から libc の状態を崩してしまう）。`exit_group` は
+ * WASIProcExit としてホストへ投げられ、wasm から制御が戻ったあとも
+ * メモリ・関数表・global はそのまま残る。
+ */
+int main(int argc, char **argv, char **envp) {
+  (void)argc;
+  (void)argv;
+  (void)envp;
+  _Exit(0);
+}

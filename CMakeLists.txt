@@ -51,12 +51,11 @@ if (NOT EMSCRIPTEN AND NOT BJVM_LINUX_MUSL)
 endif()
 
 if (BJVM_LINUX_MUSL)
-    # musl's libc.a already provides weak pthread_create/pthread_join for the non-threads
-    # variant (profiler.c references them but is compiled out unless PROFILE_STARTUP),
-    # so the old wasi_pthread_stub.c is no longer needed.
+    # musl's libc.so provides pthread_create/pthread_join (profiler.c references them but is
+    # compiled out unless PROFILE_STARTUP), so the old wasi_pthread_stub.c is no longer needed.
     add_executable(bjvm_wasm vm/bin/main.c)
     target_link_libraries(bjvm_wasm PRIVATE bjvm_static)
-    configure_linux_musl_reactor(bjvm_wasm)
+    configure_linux_musl_pie(bjvm_wasm)
 endif ()
 
 if (EMSCRIPTEN)
