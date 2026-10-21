@@ -587,6 +587,7 @@ vm *create_vm(const vm_options options) {
 
   char *error = init_classpath(&vm->bootstrap_classpath, classpath);
   vm->application_classpath = make_heap_str_from(options.classpath);
+  vm->exit_status = -1; // "System.exit has not been called"
   if (error) {
     fprintf(stderr, "Classpath error: %s", error);
     free(error);

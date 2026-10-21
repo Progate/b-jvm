@@ -118,7 +118,7 @@ DECLARE_NATIVE("jdk/internal/util", SystemProps_Raw, platformProperties, "()[Lja
 }
 
 DECLARE_NATIVE("jdk/internal/util", SystemProps_Raw, vmProperties, "()[Ljava/lang/String;") {
-  handle *props = make_string_array(thread, 4);
+  handle *props = make_string_array(thread, 6);
 
   SET_PROP(0, "java.home");
   char cwd[1024] = {0};
@@ -130,6 +130,14 @@ DECLARE_NATIVE("jdk/internal/util", SystemProps_Raw, vmProperties, "()[Ljava/lan
   SET_PROP(1, java_home.chars);
   SET_PROP(2, "java.class.path");
   SET_PROP(3, thread->vm->application_classpath.chars);
+
+  // The VM resolves application classes through the bootstrap classpath (create_vm concatenates the
+  // application classpath onto the runtime one), so application classes end up defined by the boot
+  // loader. That leaves the Java side inconsistent with the C side for *resources*: BootLoader only
+  // searches this property, so getResourceAsStream and ResourceBundle find nothing for a class the VM
+  // itself loaded happily. Appending the same path here makes the two views agree.
+  SET_PROP(4, "jdk.boot.class.path.append");
+  SET_PROP(5, thread->vm->application_classpath.chars);
 
   return (stack_value){.obj = props->obj};
 }

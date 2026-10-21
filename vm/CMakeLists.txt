@@ -33,7 +33,13 @@ set_source_files_properties(
 target_link_libraries(vm PUBLIC stb_ds)
 target_link_libraries(vm PRIVATE m)
 
-if (NOT EMSCRIPTEN)
+if (BJVM_WASI)
+    # wasi-sysroot ships no zlib, so the fetched one gets built for wasm32 too. zlibstatic does not export
+    # its include directories, and zconf.h is generated into the build tree, so both have to be added here.
+    FetchContent_MakeAvailable(zlib)
+    target_link_libraries(vm PRIVATE zlibstatic)
+    target_include_directories(vm PUBLIC ${zlib_SOURCE_DIR} ${zlib_BINARY_DIR})
+elseif (NOT EMSCRIPTEN)
     FetchContent_MakeAvailable(zlib)
     target_link_libraries(vm PRIVATE z)
 else ()

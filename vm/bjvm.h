@@ -25,7 +25,13 @@ typedef struct vm_thread vm_thread;
 typedef struct obj_header obj_header;
 
 #ifndef EMSCRIPTEN_KEEPALIVE
+#ifdef __wasi__
+// The reactor module is linked with --export-dynamic, so keeping the symbol alive with default
+// visibility is what makes it a wasm export the host can call.
+#define EMSCRIPTEN_KEEPALIVE __attribute__((used, visibility("default")))
+#else
 #define EMSCRIPTEN_KEEPALIVE // used to allow access from JS
+#endif
 #endif
 
 /**
@@ -417,6 +423,12 @@ typedef struct vm {
 
   // Passed to the system classloader via the system property "java.class.path"
   heap_string application_classpath;
+
+  // Status passed to System.exit, or -1 if it has not been called. Note that we only record it:
+  // execution is not unwound, so code after System.exit still runs. That is enough for a host that
+  // wants to report the exit code of a main() which exits at the end, and it is what the embedder
+  // reads through ffi_take_exit_status.
+  int exit_status;
 
   // Main thread group
   obj_header *main_thread_group;

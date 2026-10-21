@@ -137,8 +137,59 @@ DECLARE_NATIVE("sun/nio/fs", UnixNativeDispatcher, closedir, "(J)V") {
   return value_null();
 }
 
+#ifdef __wasi__
+// sun/nio/fs/UnixConstants in the bundled JDK was generated on Linux, so the oflags that reach open0
+// are Linux's. wasi-libc encodes them completely differently -- O_RDONLY is 0x04000000 there, not 0 --
+// so passing them through unchanged makes every open() fail with EINVAL. Notably that includes
+// lib/modules, which is how the boot layer fails to initialize.
+enum {
+  LINUX_O_ACCMODE = 03,
+  LINUX_O_WRONLY = 01,
+  LINUX_O_RDWR = 02,
+  LINUX_O_CREAT = 0100,
+  LINUX_O_EXCL = 0200,
+  LINUX_O_TRUNC = 01000,
+  LINUX_O_APPEND = 02000,
+  LINUX_O_NONBLOCK = 04000,
+  LINUX_O_DSYNC = 010000,
+  LINUX_O_DIRECTORY = 0200000,
+  LINUX_O_NOFOLLOW = 0400000,
+  LINUX_O_SYNC = 04010000,
+};
+
+static int translate_oflags(int linux_flags) {
+  int accmode = linux_flags & LINUX_O_ACCMODE;
+  int flags = accmode == LINUX_O_WRONLY ? O_WRONLY : accmode == LINUX_O_RDWR ? O_RDWR : O_RDONLY;
+
+  // O_SYNC contains the O_DSYNC bit on Linux, so it has to be tested as a whole first.
+  if ((linux_flags & LINUX_O_SYNC) == LINUX_O_SYNC)
+    flags |= O_SYNC;
+  else if (linux_flags & LINUX_O_DSYNC)
+    flags |= O_DSYNC;
+
+  if (linux_flags & LINUX_O_CREAT)
+    flags |= O_CREAT;
+  if (linux_flags & LINUX_O_EXCL)
+    flags |= O_EXCL;
+  if (linux_flags & LINUX_O_TRUNC)
+    flags |= O_TRUNC;
+  if (linux_flags & LINUX_O_APPEND)
+    flags |= O_APPEND;
+  if (linux_flags & LINUX_O_NONBLOCK)
+    flags |= O_NONBLOCK;
+  if (linux_flags & LINUX_O_DIRECTORY)
+    flags |= O_DIRECTORY;
+  if (linux_flags & LINUX_O_NOFOLLOW)
+    flags |= O_NOFOLLOW;
+
+  return flags;
+}
+#else
+static int translate_oflags(int flags) { return flags; }
+#endif
+
 DECLARE_NATIVE("sun/nio/fs", UnixNativeDispatcher, open0, "(JII)I") {
-  int result = open((char const *)args[0].l, args[1].i, args[2].i);
+  int result = open((char const *)args[0].l, translate_oflags(args[1].i), args[2].i);
   if (result >= 0)
     return (stack_value){.i = result};
 
@@ -167,7 +218,17 @@ DECLARE_NATIVE("sun/nio/ch", UnixFileDispatcherImpl, size0, "(Ljava/io/FileDescr
   return (stack_value){.l = st.st_size};
 }
 
-DECLARE_NATIVE("sun/nio/ch", UnixFileDispatcherImpl, allocationGranularity0, "()J") { return (stack_value){.l = 4096}; }
+DECLARE_NATIVE("sun/nio/ch", UnixFileDispatcherImpl, allocationGranularity0, "()J") {
+#ifdef __wasi__
+  // wasi-libc emulates mmap with malloc, so mappings are only malloc-aligned. FileChannelImpl asserts
+  // that the address map0 returns is a multiple of this granularity, and it also uses it to round map
+  // offsets down. Reporting 1 tells the truth about an allocator-backed mapping: there are no pages to
+  // align to. Reporting 4096 would make the JDK assert on the very first mapping (lib/modules).
+  return (stack_value){.l = 1};
+#else
+  return (stack_value){.l = 4096};
+#endif
+}
 
 // (fd: FileDescriptor, prot:Int, pos: Long, len: Long, isSync: Boolean) -> Long
 DECLARE_NATIVE("sun/nio/ch", UnixFileDispatcherImpl, map0, "(Ljava/io/FileDescriptor;IJJZ)J") {
@@ -199,6 +260,89 @@ DECLARE_NATIVE("sun/nio/ch", UnixFileDispatcherImpl, unmap0, "(JJ)V") {
   if (result) {
     thread->current_exception = create_unix_exception(thread, errno);
   }
+  return value_null();
+}
+
+// Ordinary (non-mapped) file I/O for FileChannel. The JDK reaches these whenever it goes through
+// java.nio -- Files.newInputStream, FileChannel.read, and everything layered on them. The buffer is a
+// raw address into the VM's linear memory, handed to us by DirectByteBuffer, so we read and write it
+// in place.
+
+// Extract the int fd out of a java.io.FileDescriptor.
+static int unwrap_fd(obj_header *file_descriptor) {
+  DCHECK(file_descriptor);
+  return LoadFieldInt(file_descriptor, "fd");
+}
+
+// The JDK signals end of file with IOStatus.EOF rather than 0.
+#define IOSTATUS_EOF (-1)
+
+DECLARE_NATIVE("sun/nio/ch", UnixFileDispatcherImpl, read0, "(Ljava/io/FileDescriptor;JI)I") {
+  ssize_t n = read(unwrap_fd(args[0].handle->obj), (void *)(uintptr_t)args[1].l, (size_t)args[2].i);
+  if (n < 0) {
+    thread->current_exception = create_unix_exception(thread, errno);
+    return value_null();
+  }
+  return (stack_value){.i = n == 0 ? IOSTATUS_EOF : (s32)n};
+}
+
+DECLARE_NATIVE("sun/nio/ch", UnixFileDispatcherImpl, pread0, "(Ljava/io/FileDescriptor;JIJ)I") {
+  ssize_t n = pread(unwrap_fd(args[0].handle->obj), (void *)(uintptr_t)args[1].l, (size_t)args[2].i,
+                    (off_t)args[3].l);
+  if (n < 0) {
+    thread->current_exception = create_unix_exception(thread, errno);
+    return value_null();
+  }
+  return (stack_value){.i = n == 0 ? IOSTATUS_EOF : (s32)n};
+}
+
+DECLARE_NATIVE("sun/nio/ch", UnixFileDispatcherImpl, write0, "(Ljava/io/FileDescriptor;JI)I") {
+  ssize_t n = write(unwrap_fd(args[0].handle->obj), (void *)(uintptr_t)args[1].l, (size_t)args[2].i);
+  if (n < 0) {
+    thread->current_exception = create_unix_exception(thread, errno);
+    return value_null();
+  }
+  return (stack_value){.i = (s32)n};
+}
+
+DECLARE_NATIVE("sun/nio/ch", UnixFileDispatcherImpl, pwrite0, "(Ljava/io/FileDescriptor;JIJ)I") {
+  ssize_t n = pwrite(unwrap_fd(args[0].handle->obj), (void *)(uintptr_t)args[1].l, (size_t)args[2].i,
+                     (off_t)args[3].l);
+  if (n < 0) {
+    thread->current_exception = create_unix_exception(thread, errno);
+    return value_null();
+  }
+  return (stack_value){.i = (s32)n};
+}
+
+DECLARE_NATIVE("sun/nio/ch", UnixFileDispatcherImpl, seek0, "(Ljava/io/FileDescriptor;J)J") {
+  int fd = unwrap_fd(args[0].handle->obj);
+  // A negative offset means "tell me where we are" rather than "seek there".
+  off_t result = args[1].l < 0 ? lseek(fd, 0, SEEK_CUR) : lseek(fd, (off_t)args[1].l, SEEK_SET);
+  if (result < 0) {
+    thread->current_exception = create_unix_exception(thread, errno);
+    return value_null();
+  }
+  return (stack_value){.l = result};
+}
+
+DECLARE_NATIVE("sun/nio/ch", UnixFileDispatcherImpl, truncate0, "(Ljava/io/FileDescriptor;J)I") {
+  if (ftruncate(unwrap_fd(args[0].handle->obj), (off_t)args[1].l) < 0) {
+    thread->current_exception = create_unix_exception(thread, errno);
+    return value_null();
+  }
+  return (stack_value){.i = 0};
+}
+
+DECLARE_NATIVE("sun/nio/ch", UnixFileDispatcherImpl, force0, "(Ljava/io/FileDescriptor;Z)I") {
+  // Nothing is buffered outside the host's filesystem, so there is nothing to flush.
+  return (stack_value){.i = 0};
+}
+
+DECLARE_NATIVE("sun/nio/ch", UnixFileDispatcherImpl, close0, "(Ljava/io/FileDescriptor;)V") {
+  int fd = unwrap_fd(args[0].handle->obj);
+  if (fd != -1)
+    close(fd);
   return value_null();
 }
 

@@ -97,7 +97,7 @@
 
 // If DO_TAILS is true, use a sequence of tail calls rather than computed goto. We try to make the code reasonably
 // generic to handle both cases efficiently. The macros necessary for the code to be semi-readable are defined here.
-#ifdef EMSCRIPTEN
+#if BJVM_WASM
 #define DO_TAILS 0 // not profitable on web
 #else
 #define DO_TAILS 1
@@ -137,7 +137,7 @@
 #pragma GCC optimize("optimize-sibling-calls")
 
 // TODO consider what to do here so that it's efficient but not UB
-#ifdef EMSCRIPTEN
+#if BJVM_WASM
 #define WITH_UNDEF(expr)                                                                                               \
   do {                                                                                                                 \
     s64 a_undef = 0;                                                                                                   \
@@ -163,9 +163,9 @@
   } while (0);
 #endif
 
-#ifdef EMSCRIPTEN
+#if BJVM_WASM
 #error "TCO mode unsupported in the browser"
-#else // !ifdef EMSCRIPTEN
+#else // !BJVM_WASM
 #define ADVANCE_INT_(tos, insn_off)                                                                                    \
   int k = insns[insn_off].kind;                                                                                        \
   s64 __tos = (s64)(tos);                                                                                              \
@@ -398,9 +398,9 @@ static s64 java_lrem(s64 const a, s64 const b) {
   return a % b;
 }
 
-// Java saturates the conversion. For Emscripten we use the builtins for saturating conversions.
+// Java saturates the conversion. On wasm we use the builtins for saturating conversions.
 static int double_to_int(double const x) {
-#ifdef EMSCRIPTEN
+#if BJVM_WASM
   return __builtin_wasm_trunc_saturate_s_i32_f64(x);
 #else
   if (x > INT_MAX)
@@ -414,7 +414,7 @@ static int double_to_int(double const x) {
 }
 
 static int float_to_int(float const x) {
-#ifdef EMSCRIPTEN
+#if BJVM_WASM
   return __builtin_wasm_trunc_saturate_s_i32_f32(x);
 #else
   return double_to_int(x);
@@ -423,7 +423,7 @@ static int float_to_int(float const x) {
 
 // Java saturates the conversion
 static s64 double_to_long(double const x) {
-#ifdef EMSCRIPTEN
+#if BJVM_WASM
   return __builtin_wasm_trunc_saturate_s_i64_f64(x);
 #else
   if (x >= (double)(ULLONG_MAX / 2))
@@ -437,7 +437,7 @@ static s64 double_to_long(double const x) {
 }
 
 static s64 float_to_long(float const x) {
-#ifdef EMSCRIPTEN
+#if BJVM_WASM
   return __builtin_wasm_trunc_saturate_s_i64_f32(x);
 #else
   return double_to_long(x);
@@ -2735,6 +2735,9 @@ __attribute__((always_inline)) static s64 entry_notco_impl(vm_thread *thread, st
       spill.temp_int_tos = int_tos;
       spill.temp_fuel = fuel;
 
+// Deliberately EMSCRIPTEN and not BJVM_WASM: the intrinsic is an import that only exists because the
+// Emscripten JS glue provides it and codegen/wasm-opt.js rewrites it into a typed funcref call. A wasi-sdk
+// build has neither, so it takes the plain C fallback.
 #ifdef EMSCRIPTEN
 #define notco_call __interpreter_intrinsic_notco_call_outlined
 #else

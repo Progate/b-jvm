@@ -1,10 +1,10 @@
 #include "unixlike-fs.h"
 
+#include "cached_classdescs.h"
+#include <dirent.h>
 #include <natives-dsl.h>
 #include <sys/stat.h>
 #include <unistd.h>
-
-#include "unixlike-fs.h"
 
 DECLARE_NATIVE("java/io", UnixFileSystem, initIDs, "()V") { return value_null(); }
 
@@ -78,6 +78,52 @@ DECLARE_NATIVE("java/io", UnixFileSystem, canonicalize0, "(Ljava/lang/String;)Lj
   free_heap_str(canonical);
 
   return (stack_value){.obj = result};
+}
+
+// File.list() / File.listFiles(). Returns null for anything that is not a readable directory, which is
+// what the JDK expects.
+DECLARE_NATIVE("java/io", UnixFileSystem, list0, "(Ljava/io/File;)[Ljava/lang/String;") {
+  obj_header *path = LoadFieldObject(args[0].handle->obj, "java/lang/String", "path");
+  heap_string path_str = AsHeapString(path, on_oom);
+
+  DIR *dir = opendir(path_str.chars);
+  free_heap_str(path_str);
+  if (!dir)
+    return value_null();
+
+  // Read the whole directory before allocating anything on the Java heap: each string we create can
+  // trigger a collection, and the DIR handle has no business being alive across one.
+  heap_string *names = nullptr;
+  for (struct dirent *entry; (entry = readdir(dir));) {
+    if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+      continue;
+    arrput(names, make_heap_str_from((slice){.chars = entry->d_name, .len = (int)strlen(entry->d_name)}));
+  }
+  closedir(dir);
+
+  int count = (int)arrlen(names);
+  handle *array = make_handle(thread, CreateObjectArray1D(thread, cached_classes(thread->vm)->string, count));
+  if (array->obj) {
+    for (int i = 0; i < count; i++) {
+      obj_header *element = MakeJStringFromModifiedUTF8(thread, hslc(names[i]), false);
+      if (!element) {
+        array->obj = nullptr; // out of memory; the exception is already pending
+        break;
+      }
+      ReferenceArrayStore(array->obj, i, element);
+    }
+  }
+
+  for (int i = 0; i < count; i++)
+    free_heap_str(names[i]);
+  arrfree(names);
+
+  obj_header *result = array->obj;
+  drop_handle(thread, array);
+  return (stack_value){.obj = result};
+
+on_oom:
+  return value_null();
 }
 
 DECLARE_NATIVE("java/io", UnixFileSystem, getLastModifiedTime, "(Ljava/io/File;)J") {

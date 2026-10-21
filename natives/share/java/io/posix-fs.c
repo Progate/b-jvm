@@ -4,7 +4,9 @@
 
 #include "posix-fs.h"
 
-#if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
+// wasi-libc does not define __unix__, but it does provide stat(2) and the errno values used below,
+// backed by whatever the host wires up to path_filestat_get.
+#if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__)) || defined(__wasi__)
 #define POSIX_SUPPORTED
 #endif
 
@@ -98,5 +100,5 @@ error:
 #else
 bool posix_fs_supported(void) { return false; }
 
-void posix_fs_init(unixlike_fs const **fs) { UNREACHABLE("POSIX fs not supported on this target platform"); }
+void posix_fs_init(unixlike_fs *fs) { UNREACHABLE("POSIX fs not supported on this target platform"); }
 #endif

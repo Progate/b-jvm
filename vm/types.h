@@ -3,6 +3,16 @@
 
 #include <stdint.h>
 
+// True whenever we are targeting WebAssembly, regardless of the toolchain (Emscripten or wasi-sdk).
+// Use this -- not EMSCRIPTEN -- for anything that is about the *target* rather than about the Emscripten
+// runtime: instruction selection, the absence of inline asm, tail calls not being profitable, and so on.
+// EMSCRIPTEN stays reserved for things that need the Emscripten JS glue (EM_ASM, WASMFS, emscripten_*).
+#if defined(EMSCRIPTEN) || defined(__wasm__)
+#define BJVM_WASM 1
+#else
+#define BJVM_WASM 0
+#endif
+
 typedef uint8_t u8;
 typedef int8_t s8;
 

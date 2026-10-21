@@ -8,11 +8,16 @@ set(CMAKE_CXX_STANDARD 23)
 
 list(APPEND CMAKE_MODULE_PATH ${bjvm_SOURCE_DIR}/cmake)
 
-include(Doctest)
 include(CTest)
 include(AsanSupport)
 include(LtoSupport)
 include(PostprocessWasm)
+include(WasiSupport)
+
+if (CMAKE_SYSTEM_NAME STREQUAL "WASI")
+    set(BJVM_WASI TRUE)
+    configure_wasi_build()
+endif ()
 
 if(NOT EMSCRIPTEN)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
@@ -22,9 +27,15 @@ set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
 add_subdirectory(vendor)
 add_subdirectory(vm)
 add_subdirectory(natives)
-add_subdirectory(codegen)
+
+# gen_natives is a build-time tool, so there is no point cross-compiling it to wasm.
+if (NOT BJVM_WASI)
+    add_subdirectory(codegen)
+endif ()
 
 if (BUILD_TESTING)
+    # Fetches doctest, so keep it out of configure when the tests are not being built.
+    include(Doctest)
     add_subdirectory(test)
 endif ()
 
@@ -32,10 +43,16 @@ add_library(bjvm_static STATIC)
 # This keeps names fixed for the post-processor
 target_link_libraries(bjvm_static PUBLIC vm PRIVATE natives)
 
-if (NOT EMSCRIPTEN)
+if (NOT EMSCRIPTEN AND NOT BJVM_WASI)
     add_library(bjvm SHARED)
     target_link_libraries(bjvm PUBLIC vm PRIVATE natives)
 endif()
+
+if (BJVM_WASI)
+    add_executable(bjvm_wasi vm/bin/main.c)
+    target_link_libraries(bjvm_wasi PRIVATE bjvm_static)
+    configure_wasi_reactor(bjvm_wasi)
+endif ()
 
 if (EMSCRIPTEN)
     target_link_options(bjvm_static PUBLIC -sEXPORTED_FUNCTIONS=_malloc,_free,_main

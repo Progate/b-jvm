@@ -3,12 +3,15 @@
 //
 
 #include "arrays.h"
+#include "cached_classdescs.h"
 #include "exceptions.h"
 #include "objects.h"
 #include "reflection.h"
 
 #include "../bjvm.h"
+#ifdef EMSCRIPTEN
 #include <emscripten/emscripten.h>
+#endif
 
 #include <roundrobin_scheduler.h>
 #include <tgmath.h>
@@ -224,6 +227,54 @@ object ffi_create_string(vm_thread *thread, const char *str, size_t len) {
 
 EMSCRIPTEN_KEEPALIVE
 bool ffi_is_string(object obj) { return obj && utf8_equals(obj->descriptor->name, "java/lang/String"); }
+
+// Status passed to System.exit since the last call (0-255), or -1 if there was none. Reading clears
+// it, so a host driving several calls in one VM does not see a stale status from an earlier one.
+EMSCRIPTEN_KEEPALIVE
+int ffi_take_exit_status(vm *vm) {
+  int status = vm->exit_status;
+  vm->exit_status = -1;
+  return status;
+}
+
+/**
+ * Build a java.lang.String[] from `count` NUL-terminated modified-UTF-8 strings laid end to end in
+ * `packed`. Returns nullptr if any allocation fails, with the pending exception left on the thread.
+ *
+ * The host cannot assemble this array itself. Every MakeJStringFromModifiedUTF8 may trigger a GC,
+ * and the GC compacts, so an array pointer handed out to JS goes stale the moment the next element
+ * is created. Keeping the loop on this side lets the array live in a handle, which the GC updates.
+ *
+ * Taking the whole batch at once (rather than exposing an allocate-array plus a store-element pair)
+ * is what makes that possible: there is no point at which the host holds a bare object pointer.
+ */
+EMSCRIPTEN_KEEPALIVE
+object ffi_create_string_array(vm_thread *thread, const char *packed, int count) {
+  DCHECK(count >= 0);
+
+  object array = CreateObjectArray1D(thread, cached_classes(thread->vm)->string, count);
+  if (!array)
+    return nullptr;
+
+  handle *array_handle = make_handle(thread, array);
+  const char *cursor = packed;
+
+  for (int i = 0; i < count; i++) {
+    size_t length = strlen(cursor);
+    object string = MakeJStringFromModifiedUTF8(thread, (slice){.chars = (char *)cursor, .len = (int)length}, false);
+    if (!string) {
+      drop_handle(thread, array_handle);
+      return nullptr;
+    }
+    // Re-read the array through the handle: creating the string above may have moved it.
+    ((object *)ArrayData(array_handle->obj))[i] = string;
+    cursor += length + 1;
+  }
+
+  object result = array_handle->obj;
+  drop_handle(thread, array_handle);
+  return result;
+}
 
 EMSCRIPTEN_KEEPALIVE
 uint8_t *ffi_get_string_data(object str) {
