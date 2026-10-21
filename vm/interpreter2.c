@@ -2792,9 +2792,18 @@ static exception_table_entry *find_exception_handler(vm_thread *thread, stack_fr
 
     if (ent->start_insn <= pc_ && pc_ < ent->end_insn) {
       if (ent->catch_type) {
-        int error = resolve_class(thread, ent->catch_type) || link_class(thread, ent->catch_type->classdesc);
+        // 投げられた例外は保留中のままなので、退避してから catch 型を解決する。ブートストラップでない
+        // ローダー（platform ローダーが定義した jdk.zipfs のクラスなど）は Java の loadClass で解決するが、
+        // 例外が保留中だと loadClass が即座に失敗し、その例外が「解決の失敗」としてキャッシュされて
+        // ハンドラーごと飛ばされていた（ZipFileSystemProvider.ensureFile の catch (IOException) が効かない）
+        handle *pending = make_handle(thread, thread->current_exception);
+        thread->current_exception = nullptr;
+        int error = resolve_class_impl(thread, ent->catch_type, frame->method->my_class->classloader) ||
+                    link_class(thread, ent->catch_type->classdesc);
+        thread->current_exception = pending->obj;
+        drop_handle(thread, pending);
         if (error)
-          continue; // can happen if the current classloader != verifier classloader?
+          continue;
       }
 
       if (!ent->catch_type || instanceof(exception_type, ent->catch_type->classdesc)) {

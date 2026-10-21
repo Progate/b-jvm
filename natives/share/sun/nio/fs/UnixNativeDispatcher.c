@@ -82,69 +82,74 @@ DECLARE_NATIVE("sun/nio/fs", UnixNativeDispatcher, getcwd, "()[B") {
   return (stack_value){.obj = array};
 }
 
-stack_value stat_impl(value *args) {
+// UnixFileAttributes の欄へ写す。stat0 / lstat0 / fstat0 / fstatat0 が共有する
+static void fill_attrs(obj_header *attrs, const struct stat *st) {
+
+#define MapAttrLong(name, value) StoreFieldLong(attrs, (#name), value)
+#define MapAttrInt(name, value) StoreFieldInt(attrs, (#name), value)
+  MapAttrInt(st_mode, st->st_mode);
+  MapAttrLong(st_ino, st->st_ino);
+  MapAttrLong(st_dev, st->st_dev);
+  MapAttrLong(st_rdev, st->st_rdev);
+  MapAttrInt(st_nlink, st->st_nlink);
+  MapAttrInt(st_uid, st->st_uid);
+  MapAttrInt(st_gid, st->st_gid);
+  MapAttrLong(st_size, st->st_size);
+
+#ifdef __APPLE__
+  MapAttrLong(st_atime_sec, st->st_atime);
+  MapAttrLong(st_atime_nsec, st->st_atimensec);
+
+  MapAttrLong(st_mtime_sec, st->st_mtime);
+  MapAttrLong(st_mtime_nsec, st->st_mtimensec);
+
+  MapAttrLong(st_ctime_sec, st->st_ctime);
+  MapAttrLong(st_ctime_nsec, st->st_ctimensec);
+#else
+  MapAttrLong(st_atime_sec, st->st_atim.tv_sec);
+  MapAttrLong(st_atime_nsec, st->st_atim.tv_nsec);
+
+  MapAttrLong(st_mtime_sec, st->st_mtim.tv_sec);
+  MapAttrLong(st_mtime_nsec, st->st_mtim.tv_nsec);
+
+  MapAttrLong(st_ctime_sec, st->st_ctim.tv_sec);
+  MapAttrLong(st_ctime_nsec, st->st_ctim.tv_nsec);
+#endif
+
+#ifdef __APPLE__
+  MapAttrLong(st_birthtime_sec, st->st_birthtime);
+  MapAttrLong(st_birthtime_nsec, st->st_birthtimensec);
+#endif
+
+#undef MapAttrLong
+#undef MapAttrInt
+
+}
+
+stack_value stat_impl(value *args, bool follow) {
   struct stat st;
 
   if (!args[1].handle)
     return value_null();
 
   uintptr_t buf = args[0].l;
-  int result = stat((char *)buf, &st);
+  int result = follow ? stat((char *)buf, &st) : lstat((char *)buf, &st);
   if (result)
     return (stack_value){.i = to_linux_errno(errno)};
 
-  obj_header *attrs = args[1].handle->obj;
-
-#define MapAttrLong(name, value) StoreFieldLong(attrs, (#name), value)
-#define MapAttrInt(name, value) StoreFieldInt(attrs, (#name), value)
-  MapAttrInt(st_mode, st.st_mode);
-  MapAttrLong(st_ino, st.st_ino);
-  MapAttrLong(st_dev, st.st_dev);
-  MapAttrLong(st_rdev, st.st_rdev);
-  MapAttrInt(st_nlink, st.st_nlink);
-  MapAttrInt(st_uid, st.st_uid);
-  MapAttrInt(st_gid, st.st_gid);
-  MapAttrLong(st_size, st.st_size);
-
-#ifdef __APPLE__
-  MapAttrLong(st_atime_sec, st.st_atime);
-  MapAttrLong(st_atime_nsec, st.st_atimensec);
-
-  MapAttrLong(st_mtime_sec, st.st_mtime);
-  MapAttrLong(st_mtime_nsec, st.st_mtimensec);
-
-  MapAttrLong(st_ctime_sec, st.st_ctime);
-  MapAttrLong(st_ctime_nsec, st.st_ctimensec);
-#else
-  MapAttrLong(st_atime_sec, st.st_atim.tv_sec);
-  MapAttrLong(st_atime_nsec, st.st_atim.tv_nsec);
-
-  MapAttrLong(st_mtime_sec, st.st_mtim.tv_sec);
-  MapAttrLong(st_mtime_nsec, st.st_mtim.tv_nsec);
-
-  MapAttrLong(st_ctime_sec, st.st_ctim.tv_sec);
-  MapAttrLong(st_ctime_nsec, st.st_ctim.tv_nsec);
-#endif
-
-#ifdef __APPLE__
-  MapAttrLong(st_birthtime_sec, st.st_birthtime);
-  MapAttrLong(st_birthtime_nsec, st.st_birthtimensec);
-#endif
-
-#undef MapAttrLong
-#undef MapAttrInt
-
+  fill_attrs(args[1].handle->obj, &st);
   return (stack_value){.i = 0};
 }
 
 DECLARE_NATIVE("sun/nio/fs", UnixNativeDispatcher, stat0, "(JLsun/nio/fs/UnixFileAttributes;)I") {
-  return stat_impl(args);
+  return stat_impl(args, true);
 }
 
 // stat0 と違い lstat0 は失敗を UnixException で返す（JDK の宣言が throws UnixException）。
 // 黙って戻ると、無いパスが「属性がすべて 0 のファイル」に見える
 DECLARE_NATIVE("sun/nio/fs", UnixNativeDispatcher, lstat0, "(JLsun/nio/fs/UnixFileAttributes;)V") {
-  stack_value result = stat_impl(args);
+  // lstat はリンクをたどらない（以前は stat を呼んでいて、リンクが指す先の属性を返していた）
+  stack_value result = stat_impl(args, false);
   if (result.i != 0)
     thread->current_exception = create_unix_exception_from_linux(thread, result.i);
   return value_null();
@@ -262,20 +267,19 @@ DECLARE_NATIVE("sun/nio/fs", UnixNativeDispatcher, realpath0, "(J)[B") {
   return (stack_value){.obj = array};
 }
 
-DECLARE_NATIVE("sun/nio/fs", UnixNativeDispatcher, rmdir, "(J)V") {
+// JDK 23 での名前は rmdir0（rmdir のままだと Files.delete でディレクトリを消せない）
+DECLARE_NATIVE("sun/nio/fs", UnixNativeDispatcher, rmdir0, "(J)V") {
   int result = rmdir((char const *)args[0].l);
   if (result != 0)
     thread->current_exception = create_unix_exception(thread, errno);
   return value_null();
 }
 
+// JDK 23 の access0 は errno を戻り値で返す（例外は投げない）。投げると呼び出し側に受け止める口が
+// 無く、Files.createDirectories が親をたどる途中で生の UnixException が漏れていた
 DECLARE_NATIVE("sun/nio/fs", UnixNativeDispatcher, access0, "(JI)I") {
   int result = access((char const *)args[0].l, args[1].i);
-  if (result == 0)
-    return (stack_value){.i = 0};
-
-  thread->current_exception = create_unix_exception(thread, errno);
-  return value_null();
+  return (stack_value){.i = result == 0 ? 0 : to_linux_errno(errno)};
 }
 
 DECLARE_NATIVE("sun/nio/ch", UnixFileDispatcherImpl, size0, "(Ljava/io/FileDescriptor;)J") {
@@ -432,3 +436,221 @@ DECLARE_NATIVE("sun/nio/fs", UnixNativeDispatcher, strerror, "(I)[B") {
 }
 
 DECLARE_NATIVE("sun/nio/ch", FileDispatcherImpl, init0, "()V") { return value_null(); }
+// ---------------------------------------------------------------------------------------------
+// JDK 23 の UnixNativeDispatcher が宣言していて、まだ無かったもの。Files.delete / move /
+// newDirectoryStream / readSymbolicLink / setPosixFilePermissions、jdk.zipfs の書き出し
+// （一時ファイルを作って rename で差し替える）などが通る。
+
+#define THROW_ERRNO()                                                                                                  \
+  do {                                                                                                                 \
+    thread->current_exception = create_unix_exception(thread, errno);                                                  \
+    return value_null();                                                                                               \
+  } while (0)
+
+// UnixConstants（Linux）の AT_* を wasi-libc の値へ
+static int translate_at_flags(int linux_flags) {
+  int flags = 0;
+  if (linux_flags & 0x100)
+    flags |= AT_SYMLINK_NOFOLLOW;
+  if (linux_flags & 0x200)
+    flags |= AT_REMOVEDIR;
+  return flags;
+}
+
+static stack_value byte_array_of(vm_thread *thread, const char *chars, size_t len) {
+  obj_header *array = CreatePrimitiveArray1D(thread, TYPE_KIND_BYTE, (int)len);
+  if (!array)
+    return value_null();
+  memcpy(ArrayData(array), chars, len);
+  return (stack_value){.obj = array};
+}
+
+// WASI には fd を複製する仕組みが無い。init が openat 系の能力を申告しないので、JDK の
+// SecureDirectoryStream（ここを呼ぶ）は選ばれない
+DECLARE_NATIVE("sun/nio/fs", UnixNativeDispatcher, dup, "(I)I") {
+  errno = ENOTSUP;
+  THROW_ERRNO();
+}
+
+DECLARE_NATIVE("sun/nio/fs", UnixNativeDispatcher, openat0, "(IJII)I") {
+  int fd = openat(args[0].i, (char const *)args[1].l, translate_oflags(args[2].i), args[3].i);
+  if (fd < 0)
+    THROW_ERRNO();
+  return (stack_value){.i = fd};
+}
+
+DECLARE_NATIVE("sun/nio/fs", UnixNativeDispatcher, close0, "(I)V") {
+  // 本物と同じく EINTR 以外の失敗も握り潰さない
+  if (close(args[0].i) != 0 && errno != EINTR)
+    THROW_ERRNO();
+  return value_null();
+}
+
+DECLARE_NATIVE("sun/nio/fs", UnixNativeDispatcher, read0, "(IJI)I") {
+  ssize_t n = read(args[0].i, (void *)args[1].l, args[2].i);
+  if (n < 0)
+    THROW_ERRNO();
+  return (stack_value){.i = (s32)n};
+}
+
+DECLARE_NATIVE("sun/nio/fs", UnixNativeDispatcher, write0, "(IJI)I") {
+  ssize_t n = write(args[0].i, (void const *)args[1].l, args[2].i);
+  if (n < 0)
+    THROW_ERRNO();
+  return (stack_value){.i = (s32)n};
+}
+
+DECLARE_NATIVE("sun/nio/fs", UnixNativeDispatcher, link0, "(JJ)V") {
+  if (link((char const *)args[0].l, (char const *)args[1].l) != 0)
+    THROW_ERRNO();
+  return value_null();
+}
+
+DECLARE_NATIVE("sun/nio/fs", UnixNativeDispatcher, unlink0, "(J)V") {
+  if (unlink((char const *)args[0].l) != 0)
+    THROW_ERRNO();
+  return value_null();
+}
+
+DECLARE_NATIVE("sun/nio/fs", UnixNativeDispatcher, unlinkat0, "(IJI)V") {
+  if (unlinkat(args[0].i, (char const *)args[1].l, translate_at_flags(args[2].i)) != 0)
+    THROW_ERRNO();
+  return value_null();
+}
+
+DECLARE_NATIVE("sun/nio/fs", UnixNativeDispatcher, rename0, "(JJ)V") {
+  if (rename((char const *)args[0].l, (char const *)args[1].l) != 0)
+    THROW_ERRNO();
+  return value_null();
+}
+
+DECLARE_NATIVE("sun/nio/fs", UnixNativeDispatcher, renameat0, "(IJIJ)V") {
+  if (renameat(args[0].i, (char const *)args[1].l, args[2].i, (char const *)args[3].l) != 0)
+    THROW_ERRNO();
+  return value_null();
+}
+
+DECLARE_NATIVE("sun/nio/fs", UnixNativeDispatcher, readlink0, "(J)[B") {
+  char target[PATH_MAX];
+  ssize_t n = readlink((char const *)args[0].l, target, sizeof(target));
+  if (n < 0)
+    THROW_ERRNO();
+  return byte_array_of(thread, target, (size_t)n);
+}
+
+DECLARE_NATIVE("sun/nio/fs", UnixNativeDispatcher, symlink0, "(JJ)V") {
+  if (symlink((char const *)args[0].l, (char const *)args[1].l) != 0)
+    THROW_ERRNO();
+  return value_null();
+}
+
+DECLARE_NATIVE("sun/nio/fs", UnixNativeDispatcher, fstat0, "(ILsun/nio/fs/UnixFileAttributes;)V") {
+  struct stat st;
+  if (fstat(args[0].i, &st) != 0)
+    THROW_ERRNO();
+  fill_attrs(args[1].handle->obj, &st);
+  return value_null();
+}
+
+DECLARE_NATIVE("sun/nio/fs", UnixNativeDispatcher, fstatat0, "(IJILsun/nio/fs/UnixFileAttributes;)V") {
+  struct stat st;
+  if (fstatat(args[0].i, (char const *)args[1].l, &st, translate_at_flags(args[2].i)) != 0)
+    THROW_ERRNO();
+  fill_attrs(args[3].handle->obj, &st);
+  return value_null();
+}
+
+DECLARE_NATIVE("sun/nio/fs", UnixNativeDispatcher, fdopendir, "(I)J") {
+  DIR *dir = fdopendir(args[0].i);
+  if (!dir)
+    THROW_ERRNO();
+  return (stack_value){.l = (s64)dir};
+}
+
+DECLARE_NATIVE("sun/nio/fs", UnixNativeDispatcher, rewind, "(J)V") {
+  rewinddir((DIR *)args[0].l);
+  return value_null();
+}
+
+DECLARE_NATIVE("sun/nio/fs", UnixNativeDispatcher, getlinelen, "(J)I") {
+  // /etc/mtab を読む Linux の FileStore 用。ここに mtab は無いので、いつも終わり
+  return (stack_value){.i = -1};
+}
+
+// WASI には所有者も権限ビットも無い。chmod / chown は「変えた」ことにし、時刻だけは本当に変える
+DECLARE_NATIVE("sun/nio/fs", UnixNativeDispatcher, chmod0, "(JI)V") { return value_null(); }
+DECLARE_NATIVE("sun/nio/fs", UnixNativeDispatcher, fchmod0, "(II)V") { return value_null(); }
+DECLARE_NATIVE("sun/nio/fs", UnixNativeDispatcher, chown0, "(JII)V") { return value_null(); }
+DECLARE_NATIVE("sun/nio/fs", UnixNativeDispatcher, lchown0, "(JII)V") { return value_null(); }
+DECLARE_NATIVE("sun/nio/fs", UnixNativeDispatcher, fchown0, "(III)V") { return value_null(); }
+
+DECLARE_NATIVE("sun/nio/fs", UnixNativeDispatcher, mknod0, "(JIJ)V") {
+  errno = ENOTSUP;
+  THROW_ERRNO();
+}
+
+// 時刻は utimes 系がマイクロ秒、futimens がナノ秒で来る
+static int set_times(int dirfd, char const *path, int fd, s64 atime, s64 mtime, bool nanos, int at_flags) {
+  struct timespec times[2];
+  s64 div = nanos ? 1000000000 : 1000000, mul = nanos ? 1 : 1000;
+  times[0] = (struct timespec){.tv_sec = atime / div, .tv_nsec = (atime % div) * mul};
+  times[1] = (struct timespec){.tv_sec = mtime / div, .tv_nsec = (mtime % div) * mul};
+  return path ? utimensat(dirfd, path, times, at_flags) : futimens(fd, times);
+}
+
+DECLARE_NATIVE("sun/nio/fs", UnixNativeDispatcher, utimes0, "(JJJ)V") {
+  if (set_times(AT_FDCWD, (char const *)args[0].l, -1, args[1].l, args[2].l, false, 0) != 0)
+    THROW_ERRNO();
+  return value_null();
+}
+
+DECLARE_NATIVE("sun/nio/fs", UnixNativeDispatcher, lutimes0, "(JJJ)V") {
+  if (set_times(AT_FDCWD, (char const *)args[0].l, -1, args[1].l, args[2].l, false, AT_SYMLINK_NOFOLLOW) != 0)
+    THROW_ERRNO();
+  return value_null();
+}
+
+DECLARE_NATIVE("sun/nio/fs", UnixNativeDispatcher, futimes0, "(IJJ)V") {
+  if (set_times(0, nullptr, args[0].i, args[1].l, args[2].l, false, 0) != 0)
+    THROW_ERRNO();
+  return value_null();
+}
+
+DECLARE_NATIVE("sun/nio/fs", UnixNativeDispatcher, futimens0, "(IJJ)V") {
+  if (set_times(0, nullptr, args[0].i, args[1].l, args[2].l, true, 0) != 0)
+    THROW_ERRNO();
+  return value_null();
+}
+
+// 利用者とグループは 1 つずつしか無い（uid / gid は stat が返す 0）
+DECLARE_NATIVE("sun/nio/fs", UnixNativeDispatcher, getpwuid, "(I)[B") { return byte_array_of(thread, "user", 4); }
+DECLARE_NATIVE("sun/nio/fs", UnixNativeDispatcher, getgrgid, "(I)[B") { return byte_array_of(thread, "user", 4); }
+DECLARE_NATIVE("sun/nio/fs", UnixNativeDispatcher, getpwnam0, "(J)I") {
+  return (stack_value){.i = strcmp((char const *)args[0].l, "user") == 0 ? 0 : -1};
+}
+DECLARE_NATIVE("sun/nio/fs", UnixNativeDispatcher, getgrnam0, "(J)I") {
+  return (stack_value){.i = strcmp((char const *)args[0].l, "user") == 0 ? 0 : -1};
+}
+
+DECLARE_NATIVE("sun/nio/fs", UnixNativeDispatcher, statvfs0, "(JLsun/nio/fs/UnixFileStoreAttributes;)V") {
+  errno = ENOTSUP;
+  THROW_ERRNO();
+}
+
+// 拡張属性は無い（UserDefinedFileAttributeView は ENOTSUP で「非対応」と分かる）
+DECLARE_NATIVE("sun/nio/fs", UnixNativeDispatcher, fgetxattr0, "(IJJI)I") {
+  errno = ENOTSUP;
+  THROW_ERRNO();
+}
+DECLARE_NATIVE("sun/nio/fs", UnixNativeDispatcher, fsetxattr0, "(IJJI)V") {
+  errno = ENOTSUP;
+  THROW_ERRNO();
+}
+DECLARE_NATIVE("sun/nio/fs", UnixNativeDispatcher, fremovexattr0, "(IJ)V") {
+  errno = ENOTSUP;
+  THROW_ERRNO();
+}
+DECLARE_NATIVE("sun/nio/fs", UnixNativeDispatcher, flistxattr, "(IJI)I") {
+  errno = ENOTSUP;
+  THROW_ERRNO();
+}

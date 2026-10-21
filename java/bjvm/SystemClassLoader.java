@@ -20,8 +20,15 @@ import java.util.List;
  * jar 内リソースも通常の file: URL として読める。
  */
 public final class SystemClassLoader extends ClassLoader {
+  /**
+   * 親は本物の AppClassLoader と同じく platform ローダーにする。ServiceLoader は
+   * ローダーから親をたどって各ローダーの service 表を見るので、親が null だと
+   * platform ローダー所属のモジュール（jdk.zipfs の ZipFileSystemProvider など）の
+   * provider が見つからない（kotlinc が klib を開く FileSystems.newFileSystem が落ちる）。
+   * クラスの解決は下の loadClass が bootstrap に渡すので、親は使わない
+   */
   public SystemClassLoader() {
-    super(null);
+    super(ClassLoader.getPlatformClassLoader());
   }
 
   private static native String[] findResources0(String name);

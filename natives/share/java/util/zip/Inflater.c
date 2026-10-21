@@ -34,19 +34,12 @@ DECLARE_NATIVE("java/util/zip", Inflater, init, "(Z)J") {
  * }
  */
 
-// todo: What is the function of needDict?
+// needDict は Z_NEED_DICT（setDictionary を待っている）
 static s64 make_return_value(int read, int written, bool finished, bool needDict) {
   return (s64)read | (s64)written << 31 | (s64)finished << 62 | (s64)needDict << 63;
 }
 
-// long addr, byte[] inputArray, int inputOff, int inputLen, byte[] outputArray, int outputOff, int outputLen
-DECLARE_NATIVE("java/util/zip", Inflater, inflateBytesBytes, "(J[BII[BII)J") {
-  assert(argc == 7);
-  z_stream *stream = (z_stream *)args[0].l;
-  u8 *src = (u8 *)ArrayData(args[1].handle->obj) + args[2].i;
-  u32 src_len = args[3].i;
-  u8 *dst = (u8 *)ArrayData(args[4].handle->obj) + args[5].i;
-  u32 dst_len = args[6].i;
+static stack_value do_inflate(z_stream *stream, u8 *src, u32 src_len, u8 *dst, u32 dst_len) {
   stream->next_in = src;
   stream->avail_in = src_len;
   stream->next_out = dst;
@@ -54,10 +47,51 @@ DECLARE_NATIVE("java/util/zip", Inflater, inflateBytesBytes, "(J[BII[BII)J") {
   int ret = inflate(stream, Z_NO_FLUSH);
   int read = (s32)(src_len - stream->avail_in);
   int written = (s32)(dst_len - stream->avail_out);
+  // JDK の checkInflateStatus と同じく、Z_BUF_ERROR は「進めなかった」、Z_NEED_DICT は辞書待ちで、
+  // どちらも終わりではない
+  if (ret == Z_BUF_ERROR)
+    return (stack_value){.l = make_return_value(0, 0, false, false)};
+  if (ret == Z_NEED_DICT)
+    return (stack_value){.l = make_return_value(read, written, false, true)};
   if (ret != Z_OK && ret != Z_STREAM_END) { // Error case (todo: test this)
     return (stack_value){.l = make_return_value(read, written, true, false)};
   }
   return (stack_value){.l = make_return_value(read, written, ret == Z_STREAM_END, false)};
+}
+
+// long addr, byte[] inputArray, int inputOff, int inputLen, byte[] outputArray, int outputOff, int outputLen
+DECLARE_NATIVE("java/util/zip", Inflater, inflateBytesBytes, "(J[BII[BII)J") {
+  return do_inflate((z_stream *)args[0].l, (u8 *)ArrayData(args[1].handle->obj) + args[2].i, args[3].i,
+                    (u8 *)ArrayData(args[4].handle->obj) + args[5].i, args[6].i);
+}
+
+// ByteBuffer の側は線形メモリーの番地で来る（DirectByteBuffer）
+DECLARE_NATIVE("java/util/zip", Inflater, inflateBytesBuffer, "(J[BIIJI)J") {
+  return do_inflate((z_stream *)args[0].l, (u8 *)ArrayData(args[1].handle->obj) + args[2].i, args[3].i,
+                    (u8 *)args[4].l, args[5].i);
+}
+
+DECLARE_NATIVE("java/util/zip", Inflater, inflateBufferBytes, "(JJI[BII)J") {
+  return do_inflate((z_stream *)args[0].l, (u8 *)args[1].l, args[2].i,
+                    (u8 *)ArrayData(args[3].handle->obj) + args[4].i, args[5].i);
+}
+
+DECLARE_NATIVE("java/util/zip", Inflater, inflateBufferBuffer, "(JJIJI)J") {
+  return do_inflate((z_stream *)args[0].l, (u8 *)args[1].l, args[2].i, (u8 *)args[3].l, args[4].i);
+}
+
+DECLARE_NATIVE("java/util/zip", Inflater, setDictionary, "(J[BII)V") {
+  inflateSetDictionary((z_stream *)args[0].l, (u8 *)ArrayData(args[1].handle->obj) + args[2].i, args[3].i);
+  return value_null();
+}
+
+DECLARE_NATIVE("java/util/zip", Inflater, setDictionaryBuffer, "(JJI)V") {
+  inflateSetDictionary((z_stream *)args[0].l, (u8 *)args[1].l, args[2].i);
+  return value_null();
+}
+
+DECLARE_NATIVE("java/util/zip", Inflater, getAdler, "(J)I") {
+  return (stack_value){.i = (s32)((z_stream *)args[0].l)->adler};
 }
 
 DECLARE_NATIVE("java/util/zip", Inflater, reset, "(J)V") {
