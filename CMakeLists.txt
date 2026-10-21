@@ -49,7 +49,7 @@ if (NOT EMSCRIPTEN AND NOT BJVM_WASI)
 endif()
 
 if (BJVM_WASI)
-    add_executable(bjvm_wasi vm/bin/main.c)
+    add_executable(bjvm_wasi vm/bin/main.c vm/wasi_pthread_stub.c)
     target_link_libraries(bjvm_wasi PRIVATE bjvm_static)
     configure_wasi_reactor(bjvm_wasi)
 endif ()
