@@ -443,6 +443,12 @@ typedef struct vm {
   // Defined moules  (name -> module *)
   string_hash_table modules;
 
+  // Packages of defined modules (internal form, e.g. "sun/util/cldr" -> module *). A class belongs to the module that
+  // owns its package (see define_class); classes whose package is not here fall back to java.base / the unnamed module.
+  // Needed so that Class.forName(Module, String) -- which the ServiceLoader uses for module-based providers such as
+  // jdk.localedata's LocaleDataMetaInfo -- sees the class in the module the boot layer expects.
+  string_hash_table packages;
+
   // Overrides for stdio (if nullptr, uses the default implementation)
   read_bytes read_stdin;
   poll_available_bytes poll_available_stdin;
@@ -512,7 +518,12 @@ typedef struct module {
   // TODO add exports, imports, yada yada
 } module;
 
-int define_module(vm *vm, slice module_name, obj_header *module);
+module *define_module(vm *vm, slice module_name, obj_header *module);
+// Records that `package_name` (internal form, '/'-separated) belongs to `module`, and moves already-loaded classes of
+// that package into it
+void add_module_package(vm *vm, module *module, slice package_name);
+// The module owning the package of `class_name` (internal form), or nullptr if none was declared
+module *find_package_module(vm *vm, slice class_name);
 
 typedef struct {
   // Overrides for stdio (if nullptr, uses the default implementation)

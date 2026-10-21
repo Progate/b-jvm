@@ -565,14 +565,56 @@ struct cached_classdescs *cached_classes(vm *vm) {
   return vm->_cached_classdescs;
 }
 
-int define_module(vm *vm, slice module_name, obj_header *module_) {
+module *define_module(vm *vm, slice module_name, obj_header *module_) {
   module *mod = calloc(1, sizeof(module));
   mod->reflection_object = module_;
   (void)hash_table_insert(&vm->modules, module_name.chars, (int)module_name.len, mod);
   if (utf8_equals(module_name, "java.base")) {
     existing_classes_are_javabase(vm, mod);
   }
-  return 0;
+  return mod;
+}
+
+// The package part of an internal class name ("java/lang/String" -> "java/lang"); empty for the unnamed package
+static slice package_of(slice class_name) {
+  for (size_t i = class_name.len; i > 0; --i) {
+    if (class_name.chars[i - 1] == '/')
+      return (slice){.chars = class_name.chars, .len = i - 1};
+  }
+  return (slice){.chars = class_name.chars, .len = 0};
+}
+
+void add_module_package(vm *vm, module *module, slice package_name) {
+  if (package_name.len == 0)
+    return;
+  (void)hash_table_insert(&vm->packages, package_name.chars, (int)package_name.len, module);
+
+  // Classes of this package may already be loaded (java.base is defined after hundreds of its classes). They were
+  // assigned to java.base by default, so move them over the same way existing_classes_are_javabase does
+  for (int classloader_i = 0; classloader_i < arrlen(vm->active_classloaders); ++classloader_i) {
+    classloader *cl = vm->active_classloaders[classloader_i];
+    hash_table_iterator it = hash_table_get_iterator(&cl->initiating);
+    char *key;
+    size_t key_len;
+    classdesc *classdesc;
+    while (hash_table_iterator_has_next(it, &key, &key_len, (void **)&classdesc)) {
+      slice pkg = package_of((slice){.chars = key, .len = key_len});
+      if (pkg.len == package_name.len && memcmp(pkg.chars, package_name.chars, pkg.len) == 0) {
+        classdesc->module = module;
+        if (classdesc->mirror) {
+          classdesc->mirror->module = module->reflection_object;
+        }
+      }
+      hash_table_iterator_next(&it);
+    }
+  }
+}
+
+module *find_package_module(vm *vm, slice class_name) {
+  slice pkg = package_of(class_name);
+  if (pkg.len == 0)
+    return nullptr;
+  return hash_table_lookup(&vm->packages, pkg.chars, (int)pkg.len);
 }
 
 module *get_module(vm *vm, slice module_name) {
@@ -599,6 +641,7 @@ vm *create_vm(const vm_options options) {
   vm->interned_strings = make_hash_table(nullptr, 0.75, 16);
   vm->class_padding = make_hash_table(nullptr, 0.75, 16);
   vm->modules = make_hash_table(free, 0.75, 16);
+  vm->packages = make_hash_table(nullptr, 0.75, 256);
   vm->main_thread_group = nullptr;
 
   vm->heap = aligned_alloc(4096, options.heap_size);
@@ -1437,7 +1480,12 @@ classdesc *define_class(vm_thread *thread, classloader *cl, slice chars, const u
   class->classloader = cl;
   class->self->classdesc = class;
 
-  if (is_builtin_class(chars)) {
+  // Prefer the module that declared this class's package (Module.defineModule0). Before the boot layer is set up
+  // no packages are known yet, so builtin classes default to java.base as before
+  module *package_module = find_package_module(vm, chars);
+  if (package_module) {
+    class->module = package_module;
+  } else if (is_builtin_class(chars)) {
     class->module = get_module(vm, STR("java.base"));
   } else {
     class->module = get_unnamed_module(thread);
