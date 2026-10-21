@@ -7,7 +7,7 @@ DECLARE_NATIVE("java/lang/ref", Finalizer, isFinalizationEnabled, "()Z") { retur
 
 DECLARE_NATIVE("java/lang/ref", Reference, refersTo0, "(Ljava/lang/Object;)Z") {
   DCHECK(argc == 1);
-  struct native_Reference *ref = (void *)obj;
+  struct native_Reference *ref = (void *)obj->obj;
   return (stack_value){.i = ref->referent == args[0].handle->obj};
 }
 
