@@ -2,6 +2,10 @@
 
 DECLARE_NATIVE("java/lang", Runtime, availableProcessors, "()I") { return (stack_value){.i = 1}; }
 
+DECLARE_NATIVE("java/lang", Runtime, totalMemory, "()J") { return (stack_value){.l = (s64)thread->vm->heap_used}; }
+
+DECLARE_NATIVE("java/lang", Runtime, freeMemory, "()J") { return (stack_value){.l = (s64)(thread->vm->heap_capacity - thread->vm->heap_used)}; }
+
 DECLARE_NATIVE("java/lang", Runtime, maxMemory, "()J") { return (stack_value){.l = LLONG_MAX}; }
 
 DECLARE_NATIVE("java/lang", Runtime, gc, "()V") {

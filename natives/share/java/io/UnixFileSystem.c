@@ -2,8 +2,12 @@
 
 #include "cached_classdescs.h"
 #include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
 #include <natives-dsl.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 DECLARE_NATIVE("java/io", UnixFileSystem, initIDs, "()V") { return value_null(); }
@@ -126,7 +130,18 @@ on_oom:
   return value_null();
 }
 
-DECLARE_NATIVE("java/io", UnixFileSystem, getLastModifiedTime, "(Ljava/io/File;)J") {
+DECLARE_NATIVE("java/io", UnixFileSystem, createDirectory0, "(Ljava/io/File;)Z") {
+  obj_header *path = LoadFieldObject(args[0].handle->obj, "java/lang/String", "path");
+  heap_string path_str = AsHeapString(path, on_oom);
+  int result = mkdir(path_str.chars, 0777);
+  free_heap_str(path_str);
+  return (stack_value){.i = result == 0};
+
+on_oom:
+  return value_null();
+}
+
+DECLARE_NATIVE("java/io", UnixFileSystem, getLastModifiedTime0, "(Ljava/io/File;)J") {
   obj_header *file_obj = args[0].handle->obj;
   obj_header *path = LoadFieldObject(file_obj, "java/lang/String", "path");
 
@@ -139,4 +154,112 @@ DECLARE_NATIVE("java/io", UnixFileSystem, getLastModifiedTime, "(Ljava/io/File;)
 
 on_oom:
   return value_null();
+}
+DECLARE_NATIVE("java/io", UnixFileSystem, delete0, "(Ljava/io/File;)Z") {
+  obj_header *path = LoadFieldObject(args[0].handle->obj, "java/lang/String", "path");
+  heap_string path_str = AsHeapString(path, on_oom);
+  int result = remove(path_str.chars);
+  free_heap_str(path_str);
+  return (stack_value){.i = result == 0};
+
+on_oom:
+  return value_null();
+}
+
+DECLARE_NATIVE("java/io", UnixFileSystem, rename0, "(Ljava/io/File;Ljava/io/File;)Z") {
+  obj_header *from = LoadFieldObject(args[0].handle->obj, "java/lang/String", "path");
+  obj_header *to = LoadFieldObject(args[1].handle->obj, "java/lang/String", "path");
+  heap_string from_str = AsHeapString(from, on_oom);
+  heap_string to_str = AsHeapString(to, on_oom2);
+  int result = rename(from_str.chars, to_str.chars);
+  free_heap_str(from_str);
+  free_heap_str(to_str);
+  return (stack_value){.i = result == 0};
+
+on_oom2:
+  free_heap_str(from_str);
+on_oom:
+  return value_null();
+}
+
+DECLARE_NATIVE("java/io", UnixFileSystem, getLength0, "(Ljava/io/File;)J") {
+  obj_header *path = LoadFieldObject(args[0].handle->obj, "java/lang/String", "path");
+  heap_string path_str = AsHeapString(path, on_oom);
+  struct stat st;
+  stack_value result = stat(path_str.chars, &st) != 0 ? (stack_value){.l = 0} : (stack_value){.l = st.st_size};
+  free_heap_str(path_str);
+  return result;
+
+on_oom:
+  return value_null();
+}
+
+DECLARE_NATIVE("java/io", UnixFileSystem, getSpace0, "(Ljava/io/File;I)J") {
+  return (stack_value){.l = LLONG_MAX / 2};
+}
+
+DECLARE_NATIVE("java/io", UnixFileSystem, setLastModifiedTime0, "(Ljava/io/File;J)Z") {
+  obj_header *path = LoadFieldObject(args[0].handle->obj, "java/lang/String", "path");
+  heap_string path_str = AsHeapString(path, on_oom);
+  struct timespec ts[2] = {{.tv_sec = args[1].l / 1000, .tv_nsec = (args[1].l % 1000) * 1000000},
+                           {.tv_sec = args[1].l / 1000, .tv_nsec = (args[1].l % 1000) * 1000000}};
+  int result = utimensat(AT_FDCWD, path_str.chars, ts, 0);
+  free_heap_str(path_str);
+  return (stack_value){.i = result == 0};
+
+on_oom:
+  return value_null();
+}
+
+DECLARE_NATIVE("java/io", UnixFileSystem, setReadOnly0, "(Ljava/io/File;)Z") {
+  obj_header *path = LoadFieldObject(args[0].handle->obj, "java/lang/String", "path");
+  heap_string path_str = AsHeapString(path, on_oom);
+  int result = chmod(path_str.chars, 0444);
+  free_heap_str(path_str);
+  return (stack_value){.i = result == 0};
+
+on_oom:
+  return value_null();
+}
+
+DECLARE_NATIVE("java/io", UnixFileSystem, setPermission0, "(Ljava/io/File;IZZ)Z") {
+  obj_header *path = LoadFieldObject(args[0].handle->obj, "java/lang/String", "path");
+  heap_string path_str = AsHeapString(path, on_oom);
+  struct stat st;
+  if (stat(path_str.chars, &st) != 0) {
+    free_heap_str(path_str);
+    return (stack_value){.i = 0};
+  }
+  mode_t mode = st.st_mode;
+  if (args[2].i) // ownerOnly
+    mode = args[1].i ? (mode | 0700) : (mode & ~0700);
+  else
+    mode = args[1].i ? (mode | 0777) : (mode & ~0777);
+  int result = chmod(path_str.chars, mode);
+  free_heap_str(path_str);
+  return (stack_value){.i = result == 0};
+
+on_oom:
+  return value_null();
+}
+
+DECLARE_NATIVE("java/io", UnixFileSystem, createFileExclusively0, "(Ljava/lang/String;)Z") {
+  heap_string path_str = AsHeapString(args[0].handle->obj, on_oom);
+  int fd = open(path_str.chars, O_CREAT | O_EXCL | O_WRONLY, 0666);
+  free_heap_str(path_str);
+  if (fd < 0) {
+    if (errno == EEXIST)
+      return (stack_value){.i = 0};
+    raise_vm_exception(thread, STR("java/io/IOException"), STR("createFileExclusively failed"));
+    return value_null();
+  }
+  close(fd);
+  return (stack_value){.i = 1};
+
+on_oom:
+  return value_null();
+}
+
+DECLARE_NATIVE("java/io", UnixFileSystem, getNameMax0, "(Ljava/lang/String;)J") {
+  return (stack_value){.l = 255};
 }

@@ -139,7 +139,14 @@ DECLARE_NATIVE("java/lang", Class, getSuperclass, "()Ljava/lang/Class;") {
 }
 
 DECLARE_NATIVE("java/lang", Class, getClassLoader, "()Ljava/lang/ClassLoader;") {
-  classloader *cl = unmirror_class(obj->obj)->classloader;
+  classdesc *cd = unmirror_class(obj->obj);
+  // アプリケーションのクラスパスから読まれたクラスは bjvm.SystemClassLoader を返す。
+  // 実 JVM でいう AppClassLoader 相当で、リソース参照（getResources 等）を
+  // アプリクラスパスから行えるようにする
+  if (cd->is_app_class) {
+    return (stack_value){.obj = system_classloader(thread)->java_mirror};
+  }
+  classloader *cl = cd->classloader;
   return (stack_value){.obj = cl->java_mirror};
 }
 
@@ -489,4 +496,40 @@ DECLARE_NATIVE("java/lang", Class, getGenericSignature0, "()Ljava/lang/String;")
 
 DECLARE_NATIVE("java/lang", Class, getProtectionDomain0, "()Ljava/security/ProtectionDomain;") {
   return value_null(); // TODO
+}
+
+DECLARE_NATIVE("java/lang", Class, isRecord0, "()Z") {
+  classdesc *desc = unmirror_class(obj->obj);
+  return (stack_value){.i = !!(desc->access_flags & 0x10000)};
+}
+
+DECLARE_NATIVE("java/lang", Class, getRecordComponents0, "()[Ljava/lang/reflect/RecordComponent;") {
+  classdesc *rc = bootstrap_lookup_class(thread, STR("java/lang/reflect/RecordComponent"));
+  if (!rc)
+    return value_null();
+  return (stack_value){.obj = CreateObjectArray1D(thread, rc, 0)};
+}
+
+DECLARE_NATIVE("java/lang", Class, getNestMembers0, "()[Ljava/lang/Class;") {
+  classdesc *desc = unmirror_class(obj->obj);
+  obj_header *arr = CreateObjectArray1D(thread, cached_classes(thread->vm)->klass, 1);
+  if (!arr)
+    return value_null();
+  ReferenceArrayStore(arr, 0, (obj_header *)get_class_mirror(thread, desc));
+  return (stack_value){.obj = arr};
+}
+
+DECLARE_NATIVE("java/lang", Class, getSigners, "()[Ljava/lang/Object;") {
+  return (stack_value){.obj = CreateObjectArray1D(thread, cached_classes(thread->vm)->object, 0)};
+}
+
+DECLARE_NATIVE("java/lang", Class, setSigners, "([Ljava/lang/Object;)V") { return value_null(); }
+
+DECLARE_NATIVE("java/lang", Class, getClassFileVersion0, "()I") {
+  return (stack_value){.i = 67}; // Java 23
+}
+
+DECLARE_NATIVE("java/lang", Class, getClassAccessFlagsRaw0, "()I") {
+  classdesc *desc = unmirror_class(obj->obj);
+  return (stack_value){.i = desc->access_flags};
 }

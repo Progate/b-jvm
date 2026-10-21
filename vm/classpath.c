@@ -10,9 +10,9 @@
 // Use mmap if we can
 #if defined(__linux__) || defined(__APPLE__)
 #include <sys/mman.h>
-#include <sys/stat.h>
 #define USE_MMAP
 #endif
+#include <sys/stat.h>
 #ifdef EMSCRIPTEN
 #include <emscripten.h>
 #endif
@@ -346,9 +346,10 @@ static bool bad_filename(const slice filename) {
   return false;
 }
 
-int lookup_classpath(classpath *cp, const slice filename, u8 **bytes, size_t *len) {
+int lookup_classpath_idx(classpath *cp, const slice filename, u8 **bytes, size_t *len, int *matched_index) {
   *bytes = nullptr;
   *len = 0;
+  if (matched_index) *matched_index = -1;
   if (bad_filename(filename)) {
     return -1;
   }
@@ -358,6 +359,7 @@ int lookup_classpath(classpath *cp, const slice filename, u8 **bytes, size_t *le
       enum jar_lookup_result result = jar_lookup(entry->jar, filename, bytes, len);
       if (result == NOT_FOUND)
         continue;
+      if (result == FOUND && matched_index) *matched_index = i;
       return -(result == CORRUPT);
     }
     // Concatenate with the desired filename (and optionally a / in between)
@@ -373,7 +375,75 @@ int lookup_classpath(classpath *cp, const slice filename, u8 **bytes, size_t *le
     fclose(f);
     *bytes = (u8 *)lb.bytes;
     *len = lb.length;
+    if (matched_index) *matched_index = i;
     return 0;
   }
   return -1;
+}
+
+int lookup_classpath(classpath *cp, const slice filename, u8 **bytes, size_t *len) {
+  return lookup_classpath_idx(cp, filename, bytes, len, nullptr);
+}
+
+// ネストしたディレクトリを mkdir -p で作る。失敗しても呼び出し側で fopen が
+// 失敗するだけなので、ここではエラーを握りつぶす
+static void mkdir_p(char *buf) {
+  for (char *p = buf + 1; *p; ++p) {
+    if (*p == '/') {
+      *p = '\0';
+      mkdir(buf, 0755);
+      *p = '/';
+    }
+  }
+  mkdir(buf, 0755);
+}
+
+heap_string *classpath_find_resources(classpath *cp, slice filename, const char *out_dir) {
+  heap_string *result = nullptr;
+  if (bad_filename(filename))
+    return result;
+
+  for (int i = 0; i < arrlen(cp->entries); ++i) {
+    classpath_entry *entry = &cp->entries[i];
+    if (entry->jar) {
+      u8 *bytes;
+      size_t len;
+      if (jar_lookup(entry->jar, filename, &bytes, &len) != FOUND)
+        continue;
+
+      // out_dir/<entry index>/<リソースパス> に展開して、それを file: で指せるようにする
+      INIT_STACK_STRING(out_path, 4096);
+      out_path = bprintf(out_path, "%s/jar%d/%.*s", out_dir, i, fmt_slice(filename));
+      // 既に展開済みなら書き直さない
+      FILE *existing = fopen(out_path.chars, "rb");
+      if (existing) {
+        fclose(existing);
+      } else {
+        // ディレクトリ部分を作って書き込む
+        heap_string dir = make_heap_str_from(out_path);
+        char *slash = strrchr(dir.chars, '/');
+        if (slash) *slash = '\0';
+        mkdir_p(dir.chars);
+        free_heap_str(dir);
+        FILE *f = fopen(out_path.chars, "wb");
+        if (f) {
+          fwrite(bytes, 1, len, f);
+          fclose(f);
+        }
+      }
+      free(bytes);
+      arrput(result, make_heap_str_from(out_path));
+      continue;
+    }
+
+    heap_string search = concat_path(entry->name, filename);
+    FILE *f = fopen(search.chars, "rb");
+    if (f) {
+      fclose(f);
+      arrput(result, search);
+    } else {
+      free_heap_str(search);
+    }
+  }
+  return result;
 }

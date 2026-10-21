@@ -464,6 +464,9 @@ typedef struct vm {
   // All active class loaders, including the bootstrap class loader
   classloader **active_classloaders;
   classloader *bootstrap_classloader;
+  // アプリケーション側クラスパス由来のクラスが getClassLoader() で返す
+  // bjvm.SystemClassLoader のローダ。初回要求時に lazy に作る
+  classloader *system_classloader;
 
   vm_thread **active_threads;
 
@@ -509,6 +512,8 @@ typedef struct vm {
 struct cached_classdescs *cached_classes(vm *vm);
 void remove_unsafe_allocation(vm *vm, void *allocation);
 classloader *get_current_classloader(vm_thread *thread);
+// bjvm.SystemClassLoader のローダを lazy に作って返す。失敗時は bootstrap を返す
+classloader *system_classloader(vm_thread *thread);
 
 // Java Module
 typedef struct module {

@@ -43,6 +43,10 @@ typedef struct {
 typedef struct {
   classpath_entry *entries;
   heap_string as_colon_separated;
+  // entries[0..runtime_entries_count) がランタイム（jdk23.jar 相当）由来。
+  // これ以降はアプリケーション側のクラスパスで、リソース検索やシステムクラスローダ
+  // の判定に使う
+  u32 runtime_entries_count;
 } classpath;
 
 // Try to initialize the classpath using the colon-separated data in "path". Supported entries are JAR files and
@@ -59,6 +63,15 @@ void free_classpath(classpath *cp);
 //   u8 *bytes; size_t len;
 //   int failed = lookup_classpath(&cp, STR("java/lang/Object.class"), &bytes, &len);
 int lookup_classpath(classpath *cp, slice filename, u8 **bytes, size_t *len);
+
+// lookup_classpath に、ヒットしたクラスパスエントリの番号を返すものを足したもの
+int lookup_classpath_idx(classpath *cp, slice filename, u8 **bytes, size_t *len, int *matched_index);
+
+// クラスファイル以外のリソース（META-INF/... など）をクラスパス全エントリから探す。
+// ディレクトリエントリでは存在確認した実パスを、jar エントリでは out_dir 配下に
+// 展開したファイルのパスを返す。戻り値は heap_string の stb 配列（呼び出し側が
+// arrfree + free_heap_str で解放する）。見つからなければ空配列
+heap_string *classpath_find_resources(classpath *cp, slice filename, const char *out_dir);
 
 #ifdef __cplusplus
 }

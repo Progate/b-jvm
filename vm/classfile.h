@@ -842,6 +842,9 @@ typedef struct classdesc {
   access_flags access_flags;
   u8 dimensions;  // array types only
   bool is_hidden; // whether this is a hidden class (added in Java 15)
+  // アプリケーション側のクラスパスから読まれたクラス。Class.getClassLoader() が
+  // システムクラスローダ相当のオブジェクトを返す判定に使う
+  bool is_app_class;
 
   cp_class_info **interfaces;
   cp_field *fields;

@@ -30,7 +30,7 @@ DECLARE_NATIVE("java/lang", Thread, start0, "()V") {
 #define this_thread ((struct native_Thread *)obj->obj)
   vm_thread *wrapped_thread = create_vm_thread(thread->vm, thread, this_thread, default_thread_options());
 
-  cp_method *run = method_lookup(obj->obj->descriptor, STR("run"), STR("()V"), false, false);
+  cp_method *run = method_lookup(obj->obj->descriptor, STR("run"), STR("()V"), true, true);
   stack_value argz[1] = {{.obj = obj->obj}};
 
   this_thread->eetop = (intptr_t)wrapped_thread;

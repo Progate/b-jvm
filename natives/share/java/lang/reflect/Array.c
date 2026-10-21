@@ -101,3 +101,78 @@ DECLARE_NATIVE("java/lang/reflect", Array, get, "(Ljava/lang/Object;I)Ljava/lang
     return call_interpreter_synchronous(thread, fromPrimitive, (stack_value[]){val});
   }
 }
+
+DECLARE_NATIVE("java/lang/reflect", Array, set, "(Ljava/lang/Object;ILjava/lang/Object;)V") {
+  DCHECK(argc == 3);
+
+  object array = args[0].handle->obj;
+  if (array->descriptor->kind == CD_KIND_ORDINARY) {
+    raise_vm_exception(thread, STR("java/lang/IllegalArgumentException"), STR("Argument is not an array"));
+    return value_null();
+  }
+
+  if (args[1].i < 0 || args[1].i >= ArrayLength(array)) {
+    raise_vm_exception(thread, STR("java/lang/ArrayIndexOutOfBoundsException"), STR(""));
+    return value_null();
+  }
+
+  if (array->descriptor->kind == CD_KIND_ORDINARY_ARRAY) {
+    ReferenceArrayStore(array, args[1].i, args[2].handle->obj);
+    return value_null();
+  }
+  if (array->descriptor->kind != CD_KIND_PRIMITIVE_ARRAY)
+    UNREACHABLE();
+
+  // プリミティブ配列: ラッパの <T>Value() を呼んで要素を書き込む
+  object wrapper = args[2].handle->obj;
+  struct unbox_spec {
+    type_kind kind;
+    slice method_name;
+    slice desc;
+  };
+  const struct unbox_spec *spec = nullptr;
+  static const struct unbox_spec SPECS[] = {
+      {TYPE_KIND_BOOLEAN, STR("booleanValue"), STR("()Z")}, {TYPE_KIND_CHAR, STR("charValue"), STR("()C")},
+      {TYPE_KIND_FLOAT, STR("floatValue"), STR("()F")},     {TYPE_KIND_DOUBLE, STR("doubleValue"), STR("()D")},
+      {TYPE_KIND_BYTE, STR("byteValue"), STR("()B")},       {TYPE_KIND_SHORT, STR("shortValue"), STR("()S")},
+      {TYPE_KIND_INT, STR("intValue"), STR("()I")},         {TYPE_KIND_LONG, STR("longValue"), STR("()J")},
+  };
+  for (size_t i = 0; i < sizeof(SPECS) / sizeof(*SPECS); ++i)
+    if (SPECS[i].kind == array->descriptor->primitive_component)
+      spec = &SPECS[i];
+  DCHECK(spec);
+
+  cp_method *unbox = method_lookup(wrapper->descriptor, spec->method_name, spec->desc, false, false);
+  DCHECK(unbox);
+  stack_value val = call_interpreter_synchronous(thread, unbox, (stack_value[]){{.obj = wrapper}});
+
+  switch (array->descriptor->primitive_component) {
+  case TYPE_KIND_BOOLEAN:
+    BooleanArrayStore(array, args[1].i, val.i);
+    break;
+  case TYPE_KIND_CHAR:
+    CharArrayStore(array, args[1].i, val.i);
+    break;
+  case TYPE_KIND_FLOAT:
+    FloatArrayStore(array, args[1].i, val.f);
+    break;
+  case TYPE_KIND_DOUBLE:
+    DoubleArrayStore(array, args[1].i, val.d);
+    break;
+  case TYPE_KIND_BYTE:
+    ByteArrayStore(array, args[1].i, val.i);
+    break;
+  case TYPE_KIND_SHORT:
+    ShortArrayStore(array, args[1].i, val.i);
+    break;
+  case TYPE_KIND_INT:
+    IntArrayStore(array, args[1].i, val.i);
+    break;
+  case TYPE_KIND_LONG:
+    LongArrayStore(array, args[1].i, val.l);
+    break;
+  default:
+    UNREACHABLE();
+  }
+  return value_null();
+}

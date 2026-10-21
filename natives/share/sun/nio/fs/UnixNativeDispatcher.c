@@ -197,6 +197,20 @@ DECLARE_NATIVE("sun/nio/fs", UnixNativeDispatcher, open0, "(JII)I") {
   return value_null();
 }
 
+DECLARE_NATIVE("sun/nio/fs", UnixNativeDispatcher, mkdir0, "(JI)V") {
+  int result = mkdir((char const *)args[0].l, args[1].i);
+  if (result != 0)
+    thread->current_exception = create_unix_exception(thread, errno);
+  return value_null();
+}
+
+DECLARE_NATIVE("sun/nio/fs", UnixNativeDispatcher, rmdir, "(J)V") {
+  int result = rmdir((char const *)args[0].l);
+  if (result != 0)
+    thread->current_exception = create_unix_exception(thread, errno);
+  return value_null();
+}
+
 DECLARE_NATIVE("sun/nio/fs", UnixNativeDispatcher, access0, "(JI)I") {
   int result = access((char const *)args[0].l, args[1].i);
   if (result == 0)

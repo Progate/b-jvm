@@ -23,6 +23,7 @@
 #include <monitors.h>
 #include <profiler.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 
 DECLARE_ASYNC(int, init_cached_classdescs,
   locals(
@@ -624,10 +625,29 @@ module *get_module(vm *vm, slice module_name) {
 vm *create_vm(const vm_options options) {
   vm *vm = calloc(1, sizeof(*vm));
 
-  INIT_STACK_STRING(classpath, 1000);
-  classpath = bprintf(classpath, "%.*s:%.*s", fmt_slice(options.runtime_classpath), fmt_slice(options.classpath));
+  // クラスパスは長くなり得る（依存 jar を列挙するため）。スタック固定バッファでは
+  // 収まりきらず後ろのエントリが静かに落ちるので、ヒープに確保する
+  u32 classpath_cap = options.runtime_classpath.len + options.classpath.len + 1;
+  char *classpath_chars = malloc(classpath_cap + 1);
+  CHECK(classpath_chars);
+  slice classpath = bprintf((slice){.chars = classpath_chars, .len = classpath_cap}, "%.*s:%.*s",
+                          fmt_slice(options.runtime_classpath), fmt_slice(options.classpath));
 
+  // ランタイム分のエントリ数を数えておく。アプリ由来のクラスを
+  // システムクラスローダ扱いにする判定（is_app_class）の境目として使う
+  u32 runtime_entries = 0;
+  for (u32 i = 0; i < options.runtime_classpath.len; i++)
+    if (options.runtime_classpath.chars[i] != ':' &&
+        (i == 0 || options.runtime_classpath.chars[i - 1] == ':'))
+      runtime_entries++;
   char *error = init_classpath(&vm->bootstrap_classpath, classpath);
+  vm->bootstrap_classpath.runtime_entries_count = runtime_entries;
+  free(classpath_chars);
+  // java.io.tmpdir=/tmp に依存するコード（Tomcat の一時ディレクトリ等）のため
+  // 最低限のディレクトリだけ先に作る
+  (void)mkdir("/tmp", 0777);
+  (void)mkdir("/bjvm-resources", 0777);
+
   vm->application_classpath = make_heap_str_from(options.classpath);
   vm->exit_status = -1; // "System.exit has not been called"
   if (error) {
@@ -671,6 +691,11 @@ vm *create_vm(const vm_options options) {
   }
 
   register_native_padding(vm);
+
+  // ResolvedMethodName の vmtarget（cp_method*）を格納するための実装依存フィールド。
+  // StackWalker の native がフィールド直前にポインタを書き込む
+  (void)hash_table_insert(&vm->class_padding, "java/lang/invoke/ResolvedMethodName", -1,
+                          (void *)(1 * sizeof(void *)));
 
   return vm;
 }
@@ -837,7 +862,7 @@ vm_thread *create_main_thread(vm *vm, thread_options options) {
   thr->stack.frame_buffer = calloc(1, thr->stack.frame_buffer_capacity = options.stack_space);
   thr->stack.frame_buffer_end = thr->stack.frame_buffer + options.stack_space;
   thr->js_jit_enabled = options.js_jit_enabled;
-  constexpr int HANDLES_CAPACITY = 200; // expand this as necessary for the VM to run
+  constexpr int HANDLES_CAPACITY = 8192; // expand this as necessary for the VM to run
   thr->handles = calloc(1, sizeof(handle) * HANDLES_CAPACITY);
   thr->handles_capacity = HANDLES_CAPACITY;
 
@@ -932,6 +957,14 @@ vm_thread *create_main_thread(vm *vm, thread_options options) {
     vm->vm_initialized = true;
   }
 
+  // アプリクラスパスのクラスに割り当てるシステムクラスローダを先に作る。
+  // ClassLoader.scl と contextClassLoader が張られ、
+  // getSystemClassLoader() 経由のリソース参照も動くようになる
+  if (vm->vm_initialized) {
+    system_classloader(thr);
+    thr->current_exception = nullptr;
+  }
+
 #if PROFILE_STARTUP
   char *profiler_data = read_profiler(prof);
   if (profiler_data) {
@@ -955,7 +988,7 @@ vm_thread *create_vm_thread(vm *vm, vm_thread *creator_thread, struct native_Thr
   thr->stack.frame_buffer = calloc(1, thr->stack.frame_buffer_capacity = options.stack_space);
   thr->stack.frame_buffer_end = thr->stack.frame_buffer + options.stack_space;
   thr->js_jit_enabled = options.js_jit_enabled;
-  const int HANDLES_CAPACITY = 200;
+  const int HANDLES_CAPACITY = 8192;
   thr->handles = calloc(1, sizeof(handle) * HANDLES_CAPACITY);
   thr->handles_capacity = HANDLES_CAPACITY;
 
@@ -1343,6 +1376,26 @@ module *get_unnamed_module(vm_thread *thread) {
   return get_unnamed_module(thread);
 }
 
+// アプリクラスパス由来クラスのためのもう一つの unnamed module。
+// java.lang.Module.getClassLoader() は loader フィールドを返すだけなので、
+// bjvm.SystemClassLoader を張った Module オブジェクトを作る。
+// （Proxy の "non-public interface is not defined by the given loader" 検査は
+// クラスではなく所属モジュールのローダを見るため）
+module *get_unnamed_app_module(vm_thread *thread) {
+  vm *vm = thread->vm;
+  module *result = get_module(vm, STR("<unnamed.app>"));
+  if (result)
+    return result;
+
+  obj_header *module_obj = new_object(thread, cached_classes(vm)->module);
+  if (!module_obj)
+    return nullptr;
+  result = define_module(vm, STR("<unnamed.app>"), module_obj);
+  StoreFieldObject(module_obj, "java/lang/ClassLoader", "loader",
+                   (void *)system_classloader(thread)->java_mirror);
+  return result;
+}
+
 bool is_builtin_class(slice chars) {
   return strncmp(chars.chars, "java/", 5) == 0 || strncmp(chars.chars, "javax/", 6) == 0 ||
          strncmp(chars.chars, "jdk/", 4) == 0 || strncmp(chars.chars, "sun/", 4) == 0;
@@ -1533,12 +1586,27 @@ static classdesc *bootstrap_load_class_from_fs(vm_thread *thread, slice chars) {
 
   u8 *bytes;
   size_t cf_len;
-  int read_status = lookup_classpath(&thread->vm->bootstrap_classpath, filename, &bytes, &cf_len);
+  int matched_index = -1;
+  int read_status =
+      lookup_classpath_idx(&thread->vm->bootstrap_classpath, filename, &bytes, &cf_len, &matched_index);
   if (read_status) {
     return nullptr;
   }
 
   classdesc *class = define_bootstrap_class(thread, chars, bytes, cf_len);
+  if (class && matched_index >= 0) {
+    class->is_app_class = (u32)matched_index >= thread->vm->bootstrap_classpath.runtime_entries_count;
+    if (class->is_app_class) {
+      // getClassLoader() が返す SystemClassLoader と対になる unnamed module に
+      // 所属させる（Module.getClassLoader() = loader フィールドの一貫性のため）
+      module *app_mod = get_unnamed_app_module(thread);
+      if (app_mod) {
+        class->module = app_mod;
+        if (class->mirror)
+          class->mirror->module = app_mod->reflection_object;
+      }
+    }
+  }
   free(bytes);
   return class;
 }
@@ -1990,6 +2058,56 @@ classloader *get_current_classloader(vm_thread *thread) {
   return thread->vm->bootstrap_classloader;
 }
 
+// bjvm.SystemClassLoader を生成して system_classloader に登録する。
+// ClassLoader.scl（getSystemClassLoader の戻り値）と、呼び出しスレッドの
+// contextClassLoader もここで張る。失敗した場合は bootstrap ローダを返す
+classloader *system_classloader(vm_thread *thread) {
+  vm *vm = thread->vm;
+  if (vm->system_classloader)
+    return vm->system_classloader;
+
+  classdesc *SCL = bootstrap_lookup_class(thread, STR("bjvm/SystemClassLoader"));
+  if (!SCL) {
+    return vm->bootstrap_classloader;
+  }
+
+  initialize_class_t init_ctx = {.args = {thread, SCL}};
+  thread->stack.synchronous_depth++;
+  future_t f = initialize_class(&init_ctx);
+  thread->stack.synchronous_depth--;
+  if (f.status != FUTURE_READY || init_ctx._result) {
+    return vm->bootstrap_classloader;
+  }
+
+  cp_method *ctor = method_lookup(SCL, STR("<init>"), STR("()V"), false, false);
+  object mirror = new_object(thread, SCL);
+  if (!ctor || !mirror) {
+    return vm->bootstrap_classloader;
+  }
+  call_interpreter_synchronous(thread, ctor, (stack_value[]){{.obj = mirror}});
+  if (thread->current_exception) {
+    return vm->bootstrap_classloader;
+  }
+
+  classloader *cl = calloc(1, sizeof(classloader));
+  CHECK(cl);
+  classloader_init(vm, cl, mirror);
+  cl->parent = vm->bootstrap_classloader;
+  arrput(vm->active_classloaders, cl);
+  vm->system_classloader = cl;
+
+  classdesc *ClassLoader = bootstrap_lookup_class(thread, STR("java/lang/ClassLoader"));
+  if (ClassLoader) {
+    cp_field *scl = field_lookup(ClassLoader, STR("scl"), STR("Ljava/lang/ClassLoader;"));
+    if (scl)
+      set_static_field(scl, (stack_value){.obj = mirror});
+  }
+  if (thread->thread_obj)
+    StoreFieldObject((obj_header *)thread->thread_obj, "java/lang/ClassLoader", "contextClassLoader", mirror);
+
+  return cl;
+}
+
 // TODO make this async
 // NOLINTNEXTLINE(misc-no-recursion)
 int resolve_class(vm_thread *thread, cp_class_info *info) {
@@ -2162,7 +2280,11 @@ struct native_Class *get_class_mirror(vm_thread *thread, classdesc *cd) {
     }
     object componentType = cd->one_fewer_dim ? (void *)get_class_mirror(thread, cd->one_fewer_dim) : nullptr;
     class_mirror->componentType = componentType;
-    class_mirror->classLoader = cd->classloader->java_mirror;
+    // アプリクラスパス由来のクラスは bjvm.SystemClassLoader の mirror を入れる。
+    // JDK では Class.classLoader フィールド経由で getClassLoader() が返るため
+    //（bootstrap クラスは null のまま）
+    class_mirror->classLoader = cd->is_app_class ? system_classloader(thread)->java_mirror
+                                                 : cd->classloader->java_mirror;
   }
   struct native_Class *result = class_mirror;
   drop_handle(thread, cm_handle);
