@@ -421,24 +421,56 @@ void read_string(vm_thread *, obj_header *obj, s8 **buf, size_t *len) {
   *len = ArrayLength(array);
 }
 
+// String.value のバイト列は coder によって LATIN1 または UTF-16 (LE) であり、
+// クラスファイル名等の照合に使う modified UTF-8 とは別物なのでここで変換する
+static size_t write_char_as_modified_utf8(char *out, u16 c) {
+  if (c == 0) {
+    out[0] = (char)0xC0;
+    out[1] = (char)0x80;
+    return 2;
+  }
+  if (c < 0x80) {
+    out[0] = (char)c;
+    return 1;
+  }
+  if (c < 0x800) {
+    out[0] = (char)(0xC0 | (c >> 6));
+    out[1] = (char)(0x80 | (c & 0x3F));
+    return 2;
+  }
+  out[0] = (char)(0xE0 | (c >> 12));
+  out[1] = (char)(0x80 | ((c >> 6) & 0x3F));
+  out[2] = (char)(0x80 | (c & 0x3F));
+  return 3;
+}
+
 int read_string_to_utf8(vm_thread *thread, heap_string *result, obj_header *obj) {
   DCHECK(obj, "String is null");
 
-  s8 *buf;
-  size_t len;
-  read_string(nullptr, obj, &buf, &len);
-  char *cbuf = malloc(len + 1);
+  struct native_String *str = (struct native_String *)obj;
+  obj_header *array = str->value;
+  s8 *buf = ArrayData(array);
+  size_t len = ArrayLength(array);
 
+  char *cbuf = malloc(len * 3 / 2 + 4);
   if (!cbuf) {
     out_of_memory(thread);
     return -1;
   }
 
-  for (size_t i = 0; i < len; ++i) {
-    cbuf[i] = buf[i];
+  size_t j = 0;
+  if (str->coder == STRING_CODER_UTF16) {
+    u16 *chars = (u16 *)buf;
+    for (size_t i = 0; i < len / 2; ++i) {
+      j += write_char_as_modified_utf8(cbuf + j, chars[i]);
+    }
+  } else {
+    for (size_t i = 0; i < len; ++i) {
+      j += write_char_as_modified_utf8(cbuf + j, (u16)(u8)buf[i]);
+    }
   }
-  cbuf[len] = 0;
-  *result = (heap_string){.chars = cbuf, .len = len};
+  cbuf[j] = 0;
+  *result = (heap_string){.chars = cbuf, .len = j};
 
   return 0;
 }

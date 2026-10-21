@@ -15,10 +15,17 @@ function(configure_wasi_build)
             # bjvm.c calls munmap when freeing Unsafe allocations. wasi-libc's emulation is malloc-backed,
             # which is all we need since nothing depends on the mapping being lazy.
             -D_WASI_EMULATED_MMAN
+            # profiler.c creates a watcher thread; wasi-libc stubs it to fail at runtime, which is fine
+            # because the profiler is never enabled under WASI.
+            -D_WASI_EMULATED_PTHREAD
+            # interpreter2.c uses __builtin_wasm_trunc_saturate_*, which requires the nontrapping-fptoint
+            # target feature (on by default in engines; wasi-sdk leaves it off for older runtimes).
+            -mnontrapping-fptoint
     )
     add_link_options(
             -fwasm-exceptions
             -lwasi-emulated-mman
+            -lwasi-emulated-pthread
             # Provides __wasm_setjmp / __wasm_longjmp, the runtime half of the SjLj lowering above.
             -lsetjmp
     )
