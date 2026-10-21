@@ -6,6 +6,7 @@
 #include <sys/fcntl.h>
 #endif
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 DECLARE_NATIVE("java/io", FileInputStream, initIDs, "()V") { return value_null(); }
@@ -139,8 +140,19 @@ DECLARE_NATIVE("java/io", FileInputStream, available0, "()I") {
   } else {
     int err = ioctl(unix_fd, FIONREAD, &available);
     if (err < 0) {
-      raise_vm_exception(thread, STR("java/io/IOException"), STR("Error getting available bytes"));
-      return value_null();
+      // wasi-libc の wasm32-wasip2 は FIONREAD を実装しておらず ENOTSUP を返す
+      // （wasm32-wasip1 は成功するが常に 0 を返す）。通常ファイルであれば
+      // 「サイズ - 現在位置」が available と一致するので、そちらで代替する。
+      // ここで例外にすると、クラスパスからリソースを読む処理がまるごと失敗する
+      struct stat st;
+      off_t position = lseek(unix_fd, 0, SEEK_CUR);
+      if (position >= 0 && fstat(unix_fd, &st) == 0 && S_ISREG(st.st_mode)) {
+        off_t remaining = st.st_size - position;
+        available = remaining > 0 ? (int)remaining : 0;
+      } else {
+        raise_vm_exception(thread, STR("java/io/IOException"), STR("Error getting available bytes"));
+        return value_null();
+      }
     }
   }
 
