@@ -1298,6 +1298,7 @@ static void parse_inner_classes_attribute(cf_byteslice attr_reader, attribute *a
   attr->kind = ATTRIBUTE_KIND_INNER_CLASSES;
   u16 count = attr->inner_classes.count = reader_next_u16(&attr_reader, "inner classes count");
   cp_class_info **classes = attr->inner_classes.classes = arena_alloc(ctx->arena, count, sizeof(cp_class_info *));
+  slice *names = attr->inner_classes.names = arena_alloc(ctx->arena, count, sizeof(slice));
   for (int i = 0; i < count; ++i) {
     cp_class_info *inner =
         &checked_cp_entry(ctx->cp, reader_next_u16(&attr_reader, "inner class index"), CP_KIND_CLASS, "inner class")
@@ -1306,8 +1307,8 @@ static void parse_inner_classes_attribute(cf_byteslice attr_reader, attribute *a
     u16 outer_index = reader_next_u16(&attr_reader, "outer class index");
     u16 inner_name_index = reader_next_u16(&attr_reader, "inner class name index");
     u16 access_flags = reader_next_u16(&attr_reader, "inner class access flags");
+    names[i] = inner_name_index ? checked_get_utf8(ctx->cp, inner_name_index, "inner class name") : null_str();
     (void)outer_index;
-    (void)inner_name_index;
     (void)access_flags; // TODO are these useful?
   }
 }

@@ -17,11 +17,7 @@ DECLARE_NATIVE("java/lang", ProcessImpl, init, "()V") { return value_null(); }
 // int[] fds,
 // boolean redirectErrorStream)
 DECLARE_NATIVE("java/lang", ProcessImpl, forkAndExec, "(I[B[B[BI[BI[B[IZ)I") {
-  // Just print the program name
-  object name_byte_array = args[2].handle->obj;
-  s8 *name = ArrayData(name_byte_array);
-  size_t len = ArrayLength(name_byte_array);
-  fprintf(stderr, "Warning: tried to fork and exec %.*s\n", (int)len, (char *)name);
+  // Spawning processes is not supported; pretend the fork failed without noisily warning
   return (stack_value){.i = 0};
 }
 

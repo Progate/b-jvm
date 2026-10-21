@@ -83,6 +83,22 @@ DECLARE_NATIVE("java/lang", Class, getEnclosingMethod0, "()[Ljava/lang/Object;")
   return result;
 }
 
+DECLARE_NATIVE("java/lang", Class, getSimpleBinaryName0, "()Ljava/lang/String;") {
+  classdesc *desc = unmirror_class(obj->obj);
+  attribute_inner_classes *inner_classes = desc->inner_classes;
+  if (inner_classes) {
+    for (int i = 0; i < inner_classes->count; ++i) {
+      if (utf8_equals_utf8(inner_classes->classes[i]->name, desc->name)) {
+        slice name = inner_classes->names[i];
+        if (name.len == 0)
+          return value_null();
+        return (stack_value){.obj = MakeJStringFromModifiedUTF8(thread, name, true)};
+      }
+    }
+  }
+  return value_null();
+}
+
 DECLARE_NATIVE("java/lang", Class, getDeclaringClass0, "()Ljava/lang/Class;") {
   classdesc *desc = unmirror_class(obj->obj);
   attribute *attr = find_attribute_by_kind(desc, ATTRIBUTE_KIND_ENCLOSING_METHOD);

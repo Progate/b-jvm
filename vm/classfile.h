@@ -703,6 +703,7 @@ typedef struct {
 typedef struct {
   int count;
   cp_class_info **classes;
+  slice *names; // inner name of each entry (empty slice for anonymous), parallel to classes
 } attribute_inner_classes;
 
 // We leave the attribute unparsed until analysis time (which is technically incorrect I think, but whatever)
