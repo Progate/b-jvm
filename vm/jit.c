@@ -254,6 +254,10 @@ enum {
   OP_F64_CONVERT_I32_S = 0xb7,
   OP_F64_CONVERT_I64_S = 0xb9,
   OP_F64_PROMOTE_F32 = 0xbb,
+  OP_I32_REINTERPRET_F32 = 0xbc,
+  OP_I64_REINTERPRET_F64 = 0xbd,
+  OP_F32_REINTERPRET_I32 = 0xbe,
+  OP_F64_REINTERPRET_I64 = 0xbf,
   OP_I32_EXTEND8_S = 0xc0,
   OP_I32_EXTEND16_S = 0xc1,
   OP_PREFIX_FC = 0xfc,
@@ -279,9 +283,23 @@ enum {
   L_Y = 11,
   L_Z = 12,
   L_W = 13,
+  L_T64 = 14,  // i64 temporary of the frame slot stores
+  L_TF32 = 15, // f32 temporary of the frame slot stores
+  L_TF64 = 16, // f64 temporary of the frame slot stores
+  L_SLOT0 = 17, // one i64 per frame slot (locals, then the operand stack): the slot cache, see below
   L_COUNT_I32 = 7, // L_BASE .. L_E
-  L_COUNT_I64 = 4, // L_X .. L_W
+  L_COUNT_I64 = 5, // L_X .. L_W, L_T64
 };
+
+// The slot cache. Within a basic block, the value of a frame slot is kept in a wasm local (L_SLOT0 + slot, the slot's
+// 8 bytes as an i64) instead of going through the frame memory at every instruction:
+// - SLOT_NONE: only the frame has it. SLOT_CLEAN: the local and the frame agree. SLOT_DIRTY: the local is newer.
+// - The frame is brought up to date (dirty slots written back) wherever something else may read it: before a branch
+//   leaves the block, at the end of the block, before a helper call or a return, and when entering an if/block. A
+//   helper may also write slots (an invoke's result), so after one nothing is cached.
+// - Inside an if/block (nesting > 0) the paths may differ, so slot stores go through to the frame and drop the cached
+//   value, and loads do not start caching a slot (a local set on one path would be unset on the other)
+enum { SLOT_NONE = 0, SLOT_CLEAN = 1, SLOT_DIRTY = 2 };
 
 /* ------------------------------------------------------------------------------------------------------------------
  * Compilation context
@@ -302,6 +320,8 @@ typedef struct {
 
   u32 locals_count;
   u32 stack_offset; // offset of frame->stack[0] from L_BASE
+  u32 slot_count;   // locals + max_stack
+  u8 *slot_state;   // SLOT_* of each frame slot
 
   const char *sigs[MAX_SIGS];
   int sig_count;
@@ -356,11 +376,17 @@ static int sig_index(jctx *c, const char *sig) {
 }
 
 // Calls a runtime helper (arguments already pushed)
+static void flush_slots(jctx *c);
+static void forget_slots(jctx *c);
+
+// Calls a runtime helper (arguments already pushed). The helper may read and write the frame and move objects (GC)
 static void call_helper(jctx *c, s32 fn, const char *sig) {
+  flush_slots(c);
   i32_const(c, fn);
   op(c, OP_CALL_INDIRECT);
   op_u(c, sig_index(c, sig));
   op_u(c, 0); // table 0
+  forget_slots(c);
 }
 
 /* Frame slots ----------------------------------------------------------------------------------------------------- */
@@ -368,44 +394,154 @@ static void call_helper(jctx *c, s32 fn, const char *sig) {
 static u32 local_offset(jctx *c, int index) { return 8 * index; }
 static u32 stack_offset(jctx *c, int depth) { return c->stack_offset + 8 * depth; }
 
-static void load_i32(jctx *c, u32 offset) {
+// The cached slot at a frame offset, or -1 when the offset is not a slot
+static int slot_of(jctx *c, u32 offset) {
+  if (offset < 8 * c->locals_count)
+    return offset % 8 == 0 ? (int)(offset / 8) : -1;
+  if (offset < c->stack_offset || (offset - c->stack_offset) % 8 != 0)
+    return -1;
+  u32 slot = c->locals_count + (offset - c->stack_offset) / 8;
+  return slot < c->slot_count ? (int)slot : -1;
+}
+
+static u32 offset_of_slot(jctx *c, int slot) {
+  return (u32)slot < c->locals_count ? 8 * (u32)slot : c->stack_offset + 8 * ((u32)slot - c->locals_count);
+}
+
+static void write_back(jctx *c, int slot) {
   local_get(c, L_BASE);
-  mem(c, OP_I32_LOAD, 2, offset);
+  local_get(c, L_SLOT0 + slot);
+  mem(c, OP_I64_STORE, 3, offset_of_slot(c, slot));
+}
+
+// Brings the frame up to date: dirty slots are written back (and stay cached, now clean). Neutral on the wasm stack,
+// so it can come between a branch condition and the branch
+static void flush_slots(jctx *c) {
+  for (u32 i = 0; i < c->slot_count; ++i)
+    if (c->slot_state[i] == SLOT_DIRTY) {
+      // A write-back on one path only would leave the slot stale on the others: dirty slots exist only at the top.
+      // Should an emitter open an if/block without flushing first, do not compile the method rather than miscompile it
+      if (c->nesting != 0)
+        c->failed = true;
+      write_back(c, (int)i);
+      c->slot_state[i] = SLOT_CLEAN;
+    }
+}
+
+// After something that may have written frame slots: read them from the frame from now on. The frame must be up to
+// date (flushed) before that something
+static void forget_slots(jctx *c) { memset(c->slot_state, SLOT_NONE, c->slot_count); }
+
+// Pushes the slot's 8 bytes as an i64, from the cache when it has them. At the top level of the block, starts caching
+static void load_slot(jctx *c, u32 offset, int slot) {
+  if (c->slot_state[slot] != SLOT_NONE) {
+    local_get(c, L_SLOT0 + slot);
+    return;
+  }
+  local_get(c, L_BASE);
+  mem(c, OP_I64_LOAD, 3, offset);
+  if (c->nesting == 0) {
+    op(c, 0x22); // local.tee
+    op_u(c, L_SLOT0 + slot);
+    c->slot_state[slot] = SLOT_CLEAN;
+  }
+}
+
+static void load_i32(jctx *c, u32 offset) {
+  int slot = slot_of(c, offset);
+  if (slot < 0) {
+    local_get(c, L_BASE);
+    mem(c, OP_I32_LOAD, 2, offset);
+    return;
+  }
+  load_slot(c, offset, slot);
+  op(c, OP_I32_WRAP_I64);
 }
 
 static void load_i64(jctx *c, u32 offset) {
-  local_get(c, L_BASE);
-  mem(c, OP_I64_LOAD, 3, offset);
+  int slot = slot_of(c, offset);
+  if (slot < 0) {
+    local_get(c, L_BASE);
+    mem(c, OP_I64_LOAD, 3, offset);
+    return;
+  }
+  load_slot(c, offset, slot);
 }
 
 static void load_f32(jctx *c, u32 offset) {
+  int slot = slot_of(c, offset);
+  if (slot >= 0 && c->slot_state[slot] != SLOT_NONE) {
+    local_get(c, L_SLOT0 + slot);
+    op(c, OP_I32_WRAP_I64);
+    op(c, OP_F32_REINTERPRET_I32);
+    return;
+  }
   local_get(c, L_BASE);
   mem(c, OP_F32_LOAD, 2, offset);
 }
 
 static void load_f64(jctx *c, u32 offset) {
+  int slot = slot_of(c, offset);
+  if (slot >= 0 && c->slot_state[slot] != SLOT_NONE) {
+    local_get(c, L_SLOT0 + slot);
+    op(c, OP_F64_REINTERPRET_I64);
+    return;
+  }
   local_get(c, L_BASE);
   mem(c, OP_F64_LOAD, 3, offset);
 }
 
-// Stores to a frame slot: push the base first (begin_store), then the value, then finish with store_*
-static void begin_store(jctx *c) { local_get(c, L_BASE); }
+// Stores to a frame slot: the value is pushed (after begin_store, which pushes nothing), then store_* takes it
+static void begin_store(jctx *c) { (void)c; }
+
+// Stores the i64 on the wasm stack as the slot's 8 bytes
+static void store_slot_i64(jctx *c, u32 offset) {
+  int slot = slot_of(c, offset);
+  if (slot >= 0 && c->nesting == 0) {
+    local_set(c, L_SLOT0 + slot);
+    c->slot_state[slot] = SLOT_DIRTY;
+    return;
+  }
+  local_set(c, L_T64);
+  local_get(c, L_BASE);
+  local_get(c, L_T64);
+  mem(c, OP_I64_STORE, 3, offset);
+  if (slot >= 0)
+    c->slot_state[slot] = SLOT_NONE;
+}
 
 // An int as the interpreter keeps it in a slot: sign-extended to 64 bits
 static void store_int(jctx *c, u32 offset) {
   op(c, OP_I64_EXTEND_I32_S);
-  mem(c, OP_I64_STORE, 3, offset);
+  store_slot_i64(c, offset);
 }
 
 // A reference: zero-extended
 static void store_ref(jctx *c, u32 offset) {
   op(c, OP_I64_EXTEND_I32_U);
-  mem(c, OP_I64_STORE, 3, offset);
+  store_slot_i64(c, offset);
 }
 
-static void store_i64(jctx *c, u32 offset) { mem(c, OP_I64_STORE, 3, offset); }
-static void store_f32(jctx *c, u32 offset) { mem(c, OP_F32_STORE, 2, offset); }
-static void store_f64(jctx *c, u32 offset) { mem(c, OP_F64_STORE, 3, offset); }
+static void store_i64(jctx *c, u32 offset) { store_slot_i64(c, offset); }
+
+// A float writes only the slot's low 4 bytes, so it goes to the frame (after the cached 8 bytes, if newer)
+static void store_f32(jctx *c, u32 offset) {
+  int slot = slot_of(c, offset);
+  local_set(c, L_TF32);
+  if (slot >= 0) {
+    if (c->slot_state[slot] == SLOT_DIRTY)
+      write_back(c, slot);
+    c->slot_state[slot] = SLOT_NONE;
+  }
+  local_get(c, L_BASE);
+  local_get(c, L_TF32);
+  mem(c, OP_F32_STORE, 2, offset);
+}
+
+static void store_f64(jctx *c, u32 offset) {
+  op(c, OP_I64_REINTERPRET_F64);
+  store_slot_i64(c, offset);
+}
 
 static void copy_slot(jctx *c, u32 from, u32 to) {
   begin_store(c);
@@ -420,6 +556,7 @@ static int depth_of_block(jctx *c, int j) { return j - c->current_block - 1 + c-
 static int depth_of_dispatch(jctx *c) { return c->block_count - 1 - c->current_block + c->nesting; }
 
 static void open_if(jctx *c) {
+  flush_slots(c);
   op(c, OP_IF);
   op(c, BLOCK_VOID);
   c->nesting++;
@@ -438,6 +575,7 @@ static void store_pc(jctx *c, int pc) {
 
 // Leave the compiled code: the interpreter continues the frame at pc
 static void bail(jctx *c, int pc, jit_status status) {
+  flush_slots(c);
   store_pc(c, pc);
   i32_const(c, status);
   op(c, OP_RETURN);
@@ -445,6 +583,7 @@ static void bail(jctx *c, int pc, jit_status status) {
 
 // Leave with the exception the helper just raised at pc
 static void return_exception(jctx *c) {
+  flush_slots(c);
   i32_const(c, JIT_STATUS_EXCEPTION);
   op(c, OP_RETURN);
 }
@@ -463,6 +602,7 @@ static void null_check(jctx *c, int l, int pc) {
 
 // Jump to target (consumes nothing). Backward jumps check the fuel first, as the interpreter's branches do
 static void jump(jctx *c, int pc, int target) {
+  flush_slots(c);
   int block = c->block_of_pc[target];
   DCHECK(block >= 0);
   if (target > pc && block > c->current_block) {
@@ -492,6 +632,7 @@ static void jump(jctx *c, int pc, int target) {
 
 // Conditional jump on the i32 condition on the wasm stack
 static void jump_if(jctx *c, int pc, int target) {
+  flush_slots(c);
   int block = c->block_of_pc[target];
   if (target > pc && block > c->current_block) {
     op(c, OP_BR_IF);
@@ -642,6 +783,7 @@ static void divide(jctx *c, int pc, int sd, bool is_long, bool is_rem) {
     i32_const(c, -1);
     op(c, OP_I32_EQ);
   }
+  flush_slots(c);
   op(c, OP_IF);
   op(c, is_long ? VT_I64 : VT_I32);
   c->nesting++;
@@ -1124,6 +1266,7 @@ static void compare_branch(jctx *c, int pc, int sd, const bytecode_insn *insn) {
 static void table_switch(jctx *c, int pc, int sd, const bytecode_insn *insn) {
   struct tableswitch_data *t = insn->tableswitch;
   int count = t->high - t->low + 1;
+  flush_slots(c);
   // block (default) { block t_{count-1} { ... block t_0 { br_table } t_0 code } ... } default code
   op(c, OP_BLOCK);
   op(c, BLOCK_VOID);
@@ -1173,6 +1316,7 @@ static void emit_return(jctx *c, int sd, insn_code_kind kind) {
   } else if (kind != insn_return) {
     copy_slot(c, stack_offset(c, sd - 1), stack_offset(c, 0));
   }
+  flush_slots(c);
   i32_const(c, JIT_STATUS_RETURN);
   op(c, OP_RETURN);
 }
@@ -1199,6 +1343,7 @@ static void emit_invoke_helper(jctx *c, int pc) {
 }
 
 static void open_block(jctx *c) {
+  flush_slots(c);
   op(c, OP_BLOCK);
   op(c, BLOCK_VOID);
   c->nesting++;
@@ -1257,8 +1402,7 @@ static bool inline_getter(jctx *c, cp_method *target, u32 slot) {
     store_f64(c, slot);
     return true;
   default:
-    op(c, OP_DROP); // not resolved: undo the pushes
-    op(c, OP_DROP);
+    op(c, OP_DROP); // not resolved: undo the push
     return false;
   }
 }
@@ -1347,6 +1491,7 @@ static void inline_call(jctx *c, u32 args_slot, bool returns) {
   op(c, OP_CALL_INDIRECT);
   op_u(c, 0); // type 0: the compiled function
   op_u(c, 0);
+  forget_slots(c); // the callee may have run the GC, which moves objects in the frame
   local_set(c, L_C);
   i32_const(c, (s32)(uintptr_t)&jit_nesting);
   i32_const(c, (s32)(uintptr_t)&jit_nesting);
@@ -1865,6 +2010,7 @@ static void emit_insn(jctx *c, int pc) {
     local_set(c, L_A);
     begin_store(c);
     local_get(c, L_A);
+    flush_slots(c);
     op(c, OP_IF);
     op(c, VT_I32);
     c->nesting++;
@@ -2059,17 +2205,46 @@ static jbuf build_module(jctx *c) {
 
   // code
   jbuf fn = {0};
-  jb_uleb(&fn, 2); // local groups
+  jb_uleb(&fn, c->slot_count ? 5 : 4); // local groups, in the order of the L_* indices
   jb_uleb(&fn, L_COUNT_I32);
   jb_byte(&fn, VT_I32);
   jb_uleb(&fn, L_COUNT_I64);
   jb_byte(&fn, VT_I64);
+  jb_uleb(&fn, 1);
+  jb_byte(&fn, VT_F32);
+  jb_uleb(&fn, 1);
+  jb_byte(&fn, VT_F64);
+  if (c->slot_count) {
+    jb_uleb(&fn, c->slot_count);
+    jb_byte(&fn, VT_I64);
+  }
   jb_bytes(&fn, c->body.data, c->body.len);
   jb_uleb(&s, 1);
   jb_uleb(&s, fn.len);
   jb_bytes(&s, fn.data, fn.len);
   free(fn.data);
   section(&module, 10, &s);
+
+  // name: the function is called after the Java method (`pkg/Class.method`), so that it shows in profilers
+  {
+    jbuf names = {0};
+    jbuf full = {0};
+    slice cls = c->method->my_class->name, m = c->method->name;
+    jb_bytes(&full, cls.chars, cls.len);
+    jb_byte(&full, '.');
+    jb_bytes(&full, m.chars, m.len);
+    jb_uleb(&names, 1); // one function
+    jb_uleb(&names, 0); // its index
+    jb_uleb(&names, full.len);
+    jb_bytes(&names, full.data, full.len);
+    name(&s, "name");
+    jb_byte(&s, 1); // subsection: function names
+    jb_uleb(&s, names.len);
+    jb_bytes(&s, names.data, names.len);
+    section(&module, 0, &s);
+    free(names.data);
+    free(full.data);
+  }
 
   free(s.data);
   return module;
@@ -2102,6 +2277,8 @@ static s32 compile(cp_method *method) {
   };
   jctx *c = &ctx;
   c->stack_offset = 8 * c->locals_count + offsetof(stack_frame, stack);
+  c->slot_count = code->max_locals + code->max_stack;
+  c->slot_state = calloc(c->slot_count + 1, 1);
   sig_index(c, "iii:i"); // type 0: the compiled function
 
   // Basic block leaders
@@ -2161,6 +2338,9 @@ static s32 compile(cp_method *method) {
   for (int pc = 0; pc < n; ++pc) {
     if (c->block_of_pc[pc] >= 0) {
       DCHECK(c->nesting == 0);
+      // the block is entered from elsewhere too: the frame has the values, nothing is cached
+      flush_slots(c);
+      forget_slots(c);
       op(c, OP_END);
       c->current_block = c->block_of_pc[pc];
     }
@@ -2175,6 +2355,7 @@ static s32 compile(cp_method *method) {
   jbuf module = build_module(c);
   free(c->body.data);
   free(c->block_of_pc);
+  free(c->slot_state);
 
   // jit_host_install は wasm 側の import 関数なので、ネイティブビルド（JIT_SUPPORTED=0）
   // ではそもそも宣言自体が存在しない
