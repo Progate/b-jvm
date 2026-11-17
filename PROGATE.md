@@ -294,6 +294,10 @@ upstream の `dumb_jit.c` は途中で止まっている（中身の多くが `n
   ドライバに渡す。ホストのスタックを守るため、入れ子は `JIT_MAX_NESTING`（64）まで
 - `interpreter2.c` の変更は、ドライバの `java_interpret_begin` で `jit_try_run` を呼ぶところと、燃料の確認の
   あとで `jit_note_hot_loop` を呼ぶところ、`jit_rt_invoke` だけ。intrinsic の enum は `jit.h` に移した
+- コンパイルしたモジュールは `env.memory` を**共有メモリ（上限 65536 ページ）として** import する。BrowserOS の
+  世界は共有メモリの 1 本だけで、b-jvm のメモリもそれである。共有でない宣言の import に共有メモリは渡せず
+  （instantiate が LinkError）、ホストの `install` は -1 を返してメソッドはインタプリタのまま残る。宣言が共有で
+  なかった間は JIT が 1 つも効いておらず、kotlinc（composec のリンク）が約 2 倍遅かった
 
 ## wasm32-unknown-linux-musl への移行（2026-11 追加分）
 

@@ -2031,8 +2031,12 @@ static jbuf build_module(jctx *c) {
   name(&s, "env");
   name(&s, "memory");
   jb_byte(&s, 0x02); // memory
-  jb_byte(&s, 0x00); // no maximum
+  // shared, with a maximum: the VM's memory is the BrowserOS world's shared memory, and a shared memory can only be
+  // imported where the import is declared shared too (otherwise instantiation fails and nothing is ever compiled).
+  // The maximum is the wasm32 limit, so it is never below the actual memory's
+  jb_byte(&s, 0x03);
   jb_uleb(&s, 0);
+  jb_uleb(&s, 65536);
   name(&s, "env");
   name(&s, "table");
   jb_byte(&s, 0x01); // table
