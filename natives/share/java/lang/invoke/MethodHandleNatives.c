@@ -65,6 +65,9 @@ DEFINE_ASYNC(fill_mn_with_method) {
     AWAIT(reflect_initialize_method, args->thread, search_on, method);
     M->flags |= MN_IS_METHOD;
   }
+  // A parameter or return type that cannot be loaded left NoClassDefFoundError pending; let it propagate
+  if (args->thread->current_exception)
+    ASYNC_RETURN_VOID();
 
   M->vmtarget = method;
   M->vmindex = args->dynamic_dispatch ? 1 : -1; // ultimately, itable or vtable entry index
@@ -164,6 +167,10 @@ DEFINE_ASYNC(resolve_mn) {
     } else {
       found = true;
       AWAIT(fill_mn_with_method, args->thread, args->mn, method, dynamic_dispatch);
+      if (args->thread->current_exception) {
+        free_heap_str(self->search_for);
+        ASYNC_RETURN(METHOD_RESOLVE_EXCEPTION);
+      }
     }
   } else {
     UNREACHABLE();
@@ -280,6 +287,8 @@ DECLARE_ASYNC_NATIVE("java/lang/invoke", MethodHandleNatives, init,
   if (utf8_equals(s, "java/lang/reflect/Method")) {
     cp_method *m = unmirror_method(target);
     AWAIT(fill_mn_with_method, thread, self->mn, m, true);
+    if (thread->current_exception)
+      ASYNC_RETURN(value_null());
 
 #undef M
 #define M ((struct native_MemberName *)self->mn->obj)
@@ -287,6 +296,8 @@ DECLARE_ASYNC_NATIVE("java/lang/invoke", MethodHandleNatives, init,
     M->flags |= (m->access_flags & ACCESS_STATIC) ? MH_KIND_INVOKE_STATIC << 24 : MH_KIND_INVOKE_VIRTUAL << 24;
   } else if (utf8_equals(s, "java/lang/reflect/Constructor")) {
     AWAIT(fill_mn_with_method, thread, self->mn, unmirror_ctor(target), true);
+    if (thread->current_exception)
+      ASYNC_RETURN(value_null());
     M->flags |= MH_KIND_NEW_INVOKE_SPECIAL << 24;
   } else if (utf8_equals(s, "java/lang/reflect/Field")) {
     cp_field *field = *unmirror_field(target);

@@ -1380,11 +1380,16 @@ DEFINE_ASYNC(resolve_mh_invoke) {
     link_class(thread, method->class_info->classdesc);
 
   m = method_lookup(method->class_info->classdesc, method->nat->name, method->nat->descriptor, true, true);
+  // The reflected member belongs to the class that declares it, not the one the constant names: its slot indexes
+  // the declaring class's methods, so a method inherited from a superclass (`Sub::inherited`) would point elsewhere
   if (MH_KIND_NEW_INVOKE_SPECIAL == info->handle_kind) {
-    AWAIT(reflect_initialize_constructor, thread, method->class_info->classdesc, m);
+    AWAIT(reflect_initialize_constructor, thread, m->my_class, m);
   } else {
-    AWAIT(reflect_initialize_method, thread, method->class_info->classdesc, m);
+    AWAIT(reflect_initialize_method, thread, m->my_class, m);
   }
+  // A parameter or return type that cannot be loaded left NoClassDefFoundError pending
+  if (thread->current_exception)
+    ASYNC_RETURN(nullptr);
 
   classdesc *MemberName = cached_classes(thread->vm)->member_name;
 
