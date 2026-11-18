@@ -521,6 +521,7 @@ typedef enum {
   ATTRIBUTE_KIND_STACK_MAP_TABLE,
   ATTRIBUTE_KIND_INNER_CLASSES,
   ATTRIBUTE_KIND_PERMITTED_SUBCLASSES,
+  ATTRIBUTE_KIND_NEST_MEMBERS,
 } attribute_kind;
 
 typedef struct method_descriptor {
@@ -712,6 +713,7 @@ typedef struct {
   int count;
   cp_class_info **classes;
   slice *names; // inner name of each entry (empty slice for anonymous), parallel to classes
+  cp_class_info **outers; // outer class of each entry (nullptr for local/anonymous), parallel to classes
 } attribute_inner_classes;
 
 // We leave the attribute unparsed until analysis time (which is technically incorrect I think, but whatever)
@@ -748,6 +750,7 @@ typedef struct attribute {
     attribute_stack_map_table smt;
     attribute_inner_classes inner_classes;
     attribute_permitted_subclasses permitted_subclasses;
+    attribute_permitted_subclasses nest_members; // same shape: a list of classes
     cp_class_info *nest_host;
   };
 } attribute;

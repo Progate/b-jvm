@@ -100,18 +100,26 @@ DECLARE_NATIVE("java/lang", Class, getSimpleBinaryName0, "()Ljava/lang/String;")
 }
 
 DECLARE_NATIVE("java/lang", Class, getDeclaringClass0, "()Ljava/lang/Class;") {
+  // Like HotSpot's JVM_GetDeclaringClass: only member classes have a declaring class, and it is the
+  // outer_class_info of this class's own entry in InnerClasses. EnclosingMethod belongs to local and
+  // anonymous classes, whose declaring class is null.
   classdesc *desc = unmirror_class(obj->obj);
-  attribute *attr = find_attribute_by_kind(desc, ATTRIBUTE_KIND_ENCLOSING_METHOD);
-  if (!attr) {
+  attribute_inner_classes *inner_classes = desc->inner_classes;
+  if (!inner_classes) {
     return value_null();
   }
-  attribute_enclosing_method enclosing_method = attr->enclosing_method;
-  if (!enclosing_method.class_info) {
-    return value_null();
+  for (int i = 0; i < inner_classes->count; ++i) {
+    if (!utf8_equals_utf8(inner_classes->classes[i]->name, desc->name))
+      continue;
+    cp_class_info *outer = inner_classes->outers[i];
+    if (!outer) {
+      return value_null();
+    }
+    int error = resolve_class(thread, outer);
+    CHECK(!error);
+    return (stack_value){.obj = (void *)get_class_mirror(thread, outer->classdesc)};
   }
-  int error = resolve_class(thread, enclosing_method.class_info);
-  CHECK(!error);
-  return (stack_value){.obj = (void *)enclosing_method.class_info->classdesc->mirror};
+  return value_null();
 }
 
 DECLARE_NATIVE("java/lang", Class, getComponentType, "()Ljava/lang/Class;") {
@@ -511,12 +519,40 @@ DECLARE_NATIVE("java/lang", Class, getRecordComponents0, "()[Ljava/lang/reflect/
 }
 
 DECLARE_NATIVE("java/lang", Class, getNestMembers0, "()[Ljava/lang/Class;") {
-  classdesc *desc = unmirror_class(obj->obj);
-  obj_header *arr = CreateObjectArray1D(thread, cached_classes(thread->vm)->klass, 1);
-  if (!arr)
+  // Like HotSpot's JVM_GetNestMembers: the nest host followed by the members its NestMembers attribute lists.
+  // Libraries walk these to find nested types (Hibernate collects DialectOverride's nested annotations this way)
+  classdesc *host = unmirror_class(obj->obj);
+  if (host->nest_host && resolve_class(thread, host->nest_host) == 0)
+    host = host->nest_host->classdesc;
+  attribute *attr = find_attribute_by_kind(host, ATTRIBUTE_KIND_NEST_MEMBERS);
+  int listed = attr ? attr->nest_members.entries_count : 0;
+  // Create the mirrors first in case one of them triggers a GC
+  get_class_mirror(thread, host);
+  int count = 1;
+  for (int i = 0; i < listed; ++i) {
+    cp_class_info *info = attr->nest_members.entries[i];
+    if (resolve_class(thread, info) == 0 && info->classdesc) {
+      get_class_mirror(thread, info->classdesc);
+      ++count;
+    } else {
+      thread->current_exception = nullptr; // HotSpot leaves out members that fail to load
+    }
+  }
+  handle *array = make_handle(thread, CreateObjectArray1D(thread, cached_classes(thread->vm)->klass, count));
+  if (!array->obj) {
+    drop_handle(thread, array);
     return value_null();
-  ReferenceArrayStore(arr, 0, (obj_header *)get_class_mirror(thread, desc));
-  return (stack_value){.obj = arr};
+  }
+  int j = 0;
+  ((object *)ArrayData(array->obj))[j++] = (void *)get_class_mirror(thread, host);
+  for (int i = 0; i < listed; ++i) {
+    cp_class_info *info = attr->nest_members.entries[i];
+    if (info->classdesc)
+      ((object *)ArrayData(array->obj))[j++] = (void *)get_class_mirror(thread, info->classdesc);
+  }
+  object result = array->obj;
+  drop_handle(thread, array);
+  return (stack_value){.obj = result};
 }
 
 DECLARE_NATIVE("java/lang", Class, getSigners, "()[Ljava/lang/Object;") {
