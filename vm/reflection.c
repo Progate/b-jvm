@@ -31,6 +31,9 @@ DEFINE_ASYNC(reflect_initialize_field) {
     goto oom;
   F->clazz = mirror;
   AWAIT(load_class_of_field_descriptor, thread, f->my_class->classloader, f->descriptor);
+  // A type that cannot be loaded leaves NoClassDefFoundError pending (as HotSpot does), and the result is not a class
+  if (thread->current_exception)
+    goto oom;
   mirror = (void *)get_class_mirror(thread, get_async_result(load_class_of_field_descriptor));
   F->type = mirror;
   F->modifiers = f->access_flags;
@@ -86,11 +89,16 @@ DEFINE_ASYNC(reflect_initialize_constructor) {
   for (int i = 0; i < method->descriptor->args_count; ++i) {
     slice desc = method->descriptor->args[i].unparsed;
     AWAIT(load_class_of_field_descriptor, thread, method->my_class->classloader, desc);
+    if (thread->current_exception)
+      break;
     struct native_Class *type = (void *)get_class_mirror(thread, get_async_result(load_class_of_field_descriptor));
     ((struct native_Class **)ArrayData(C->parameterTypes))[i] = type;
   }
 
 #undef C
+  // Do not leave a half-filled Constructor cached for the next caller
+  if (thread->current_exception)
+    method->reflection_ctor = nullptr;
   drop_handle(thread, result);
 
 #undef method
@@ -154,6 +162,8 @@ DEFINE_ASYNC(reflect_initialize_method) {
   for (int i = 0; i < method->descriptor->args_count; ++i) {
     slice desc = method->descriptor->args[i].unparsed;
     AWAIT(load_class_of_field_descriptor, thread, method->my_class->classloader, desc);
+    if (thread->current_exception)
+      goto oom;
     object mirror = (void *)get_class_mirror(thread, get_async_result(load_class_of_field_descriptor));
     if (!mirror)
       goto oom;
@@ -162,6 +172,8 @@ DEFINE_ASYNC(reflect_initialize_method) {
 
   slice ret_desc = method->descriptor->return_type.unparsed;
   AWAIT(load_class_of_field_descriptor, thread, method->my_class->classloader, ret_desc);
+  if (thread->current_exception)
+    goto oom;
   mirror = (void *)get_class_mirror(thread, get_async_result(load_class_of_field_descriptor));
   if (!mirror)
     goto oom;

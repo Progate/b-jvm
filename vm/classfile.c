@@ -1303,6 +1303,7 @@ static void parse_inner_classes_attribute(cf_byteslice attr_reader, attribute *a
   u16 count = attr->inner_classes.count = reader_next_u16(&attr_reader, "inner classes count");
   cp_class_info **classes = attr->inner_classes.classes = arena_alloc(ctx->arena, count, sizeof(cp_class_info *));
   slice *names = attr->inner_classes.names = arena_alloc(ctx->arena, count, sizeof(slice));
+  cp_class_info **outers = attr->inner_classes.outers = arena_alloc(ctx->arena, count, sizeof(cp_class_info *));
   for (int i = 0; i < count; ++i) {
     cp_class_info *inner =
         &checked_cp_entry(ctx->cp, reader_next_u16(&attr_reader, "inner class index"), CP_KIND_CLASS, "inner class")
@@ -1312,7 +1313,9 @@ static void parse_inner_classes_attribute(cf_byteslice attr_reader, attribute *a
     u16 inner_name_index = reader_next_u16(&attr_reader, "inner class name index");
     u16 access_flags = reader_next_u16(&attr_reader, "inner class access flags");
     names[i] = inner_name_index ? checked_get_utf8(ctx->cp, inner_name_index, "inner class name") : null_str();
-    (void)outer_index;
+    outers[i] = outer_index
+                    ? &checked_cp_entry(ctx->cp, outer_index, CP_KIND_CLASS, "outer class")->class_info
+                    : nullptr;
     (void)access_flags; // TODO are these useful?
   }
 }
@@ -1364,6 +1367,15 @@ static void parse_attribute(cf_byteslice *reader, classfile_parse_ctx *ctx, attr
                                                CP_KIND_CLASS, "permitted subclass")
                                   ->class_info;
       entries[i] = entry;
+    }
+  } else if (utf8_equals(attr->name, "NestMembers")) {
+    attr->kind = ATTRIBUTE_KIND_NEST_MEMBERS;
+    int count = attr->nest_members.entries_count = reader_next_u16(&attr_reader, "nest members count");
+    cp_class_info **entries = attr->nest_members.entries = arena_alloc(ctx->arena, count, sizeof(cp_class_info *));
+    for (int i = 0; i < count; ++i) {
+      entries[i] =
+          &checked_cp_entry(ctx->cp, reader_next_u16(&attr_reader, "nest member index"), CP_KIND_CLASS, "nest member")
+               ->class_info;
     }
   } else if (utf8_equals(attr->name, "SourceFile")) {
     attr->kind = ATTRIBUTE_KIND_SOURCE_FILE;

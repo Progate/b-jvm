@@ -377,6 +377,28 @@ crt が `init_modules` で全モジュールのコンストラクタを回し、
   `find_package(ZLIB)` で sysroot の libz.so を動的に結ぶ（`NEEDED libz.so`）。実行時の libz.so は
   @progate/browser-libc の `libcPackage()` が置く。ネイティブ版の分岐は upstream のまま
 
+## Spring Boot を動かすための穴埋め（2026-11 追加分）
+
+Spring Boot 4.1（webmvc・Thymeleaf・Spring Data JPA / Hibernate 7・H2）を起動しようとして見つかったもの。
+いずれも実 JDK（HotSpot）との差:
+
+- `vm/classfile.h`・`vm/classfile.c`・`natives/share/java/lang/Class.c` … `getDeclaringClass0` を InnerClasses の
+  outer_class_info から引く。EnclosingMethod（ローカル・無名クラスだけが持つ）を見ていたので、メンバクラスの宣言元が
+  null になり、`LinkedHashMap$LinkedValues` の型変数 `V` を外側でたどれず `TypeNotPresentException: Type V not present`
+  になっていた（Spring が複数の bean を `Map.values()` で受け取るときに踏む）
+- `natives/share/java/lang/Class.c` … `getNestMembers0` が自分だけを返していた。NestMembers 属性を読み、host と
+  その一覧を返す（Hibernate は `DialectOverride.class.getNestMembers()` で入れ子の注釈を集める）
+- `natives/share/java/lang/reflect/Executable.c`・`Field.c` … `getTypeAnnotationBytes0`（RuntimeVisibleTypeAnnotations
+  をそのまま返す）
+- `natives/share/sun/nio/ch/NativeThread.c` … `supportPendingSignals0`。`signal0` は何もしないので false を返す
+  （Tomcat の NIO コネクタの起動で呼ばれる）
+- `vm/reflection.c`・`natives/share/java/lang/invoke/MethodHandleNatives.c`・`vm/bjvm.c` … 引数・戻り値の型の
+  クラスが読めないとき、読めなかった結果（前回の値が残っている）を `get_class_mirror` に渡して wasm のトラップに
+  なっていた。NoClassDefFoundError を残したまま抜け、呼び出し側もそれを見て抜ける（Spring は任意依存のクラスが
+  無いことをこの例外で知る）
+- `vm/bjvm.c` … `resolve_mh_invoke` が Method の `clazz` に定数が名指すクラスを渡していた。`slot` は宣言クラスの
+  methods の番号なので、継承したメソッドの参照（`Sub::inherited`）では別のメソッドを指して壊れる。宣言クラスを渡す
+
 ## upstream に追従するとき
 
 上記の変更はいずれも既存コードへの小さな条件分岐で、`vm/interpreter2.c` 以外は独立している。
