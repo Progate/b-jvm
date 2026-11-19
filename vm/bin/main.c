@@ -8,6 +8,7 @@
 #include "cached_classdescs.h"
 #include "exceptions.h"
 #include "objects.h"
+#include "jit.h"
 #include "reflection.h"
 
 #include "../bjvm.h"
@@ -454,26 +455,361 @@ void ffi_set_preemption_frequency_usec(rr_scheduler *scheduler, double us) {
   scheduler->preemption_us = us > (double)UINT64_MAX ? UINT64_MAX : (u64)us;
 }
 
-/*
- * -pie の入口。ローダー（browser-dyld）が libc.so とこのモジュールを instantiate したあと、
- * ホストが `_start` を 1 度だけ呼ぶ。crt は `__libc_start_main` → `init_modules` で
- * **全モジュールのコンストラクタ**を回してから `main` へ来るので、ここに来た時点で
- * libc と b-jvm の静的初期化は済んでいる。
- *
- * main は「初期化が終わった」の印だけで、中身は無い。`_Exit` で止めるのは、
- * 以後ホストが `ffi_*` を呼んで使い続けるプロセスイメージを壊さないためである
- * （`return` や `exit` だと atexit とデストラクタ（`fini_modules`）が走り、
- * 生きている VM の下から libc の状態を崩してしまう）。`exit_group` は
- * WASIProcExit としてホストへ投げられ、wasm から制御が戻ったあとも
- * メモリ・関数表・global はそのまま残る。
- *
- * 引数は 2 つにする。clang は wasm で引数を取る main を `__main_argc_argv` という名前にするが、
- * それは引数が 2 つのときだけで、`envp` まで取る 3 引数の main は `main` のまま出る。crt1 は
- * `__main_argc_argv` か `__main_void` しか呼ばないので、3 引数にすると main が呼ばれず
- * 「called undefined weak function __main_argc_argv」で起動が止まる
- */
+#ifdef EMSCRIPTEN
+// Emscripten のビルドは JS のグルーが ffi_* を呼んで VM を動かすので、main は初期化の印だけでよい
 int main(int argc, char **argv) {
   (void)argc;
   (void)argv;
-  _Exit(0);
+  return 0;
 }
+#else
+/*
+ * Linux のプログラムとしての入口（wasm32-unknown-linux-musl。BrowserOS のカーネルが execve(2) で起こす）。
+ *
+ * 引数は `java` の起動の後半だけを受ける。`-jar`・`-m`・`@引数ファイル`・`JDK_JAVA_OPTIONS` のような、
+ * どのクラスを走らせるかを決めるまでの前半は、ランチャー（@progate/browser-java の `/usr/bin/java`）が片付けてから
+ * ここへ execve(2) で入れ替わる:
+ *
+ *   bjvm [-cp <クラスパス>] [-Xmx<大きさ>] [-D<名前>=<値>]... [-javaagent:<jar>[=<引数>]]... [--dry-run]
+ *        [--and-then <n>] <main クラス> [引数...] [次の bjvm の引数 n 個]
+ *
+ * `--and-then <n>` は、main が終了コード 0 で終わったら、末尾の n 個を引数にして自分（/proc/self/exe）へ execve(2) で
+ * 入れ替わる。`java Foo.java` がこれで「ECJ でコンパイルしてから、別の VM で走らせる」を 1 つのプロセスで済ませる
+ * （ECJ は System.exit で終わるので、同じ VM では続けられない）
+ *
+ * JDK 本体の jar は環境変数 BOOT_CLASSPATH で渡る（→ vm/bjvm.c の get_default_boot_cp）。
+ * 終了コードは本物の java と同じ: System.exit の値、捕まらなかった例外なら 1、起動の誤りなら 1。
+ * Ctrl-C と kill(2) はカーネルが既定の動作でこのプロセスを止める
+ */
+#include <errno.h>
+#include <stdio.h>
+#include <time.h>
+
+// 全スレッドが期限の無い待ちに入ったとき（Object.wait・入出力の待ちなど）に、いちど眠る長さ。
+// 待ちを解くのは同じプロセスの中のスレッドだけなので、短く眠って見直す
+#define LAUNCHER_IDLE_SLEEP_US 10000
+
+// 本物の java のランチャーの既定（DEFAULT_HEAP_SIZE と同じ 64MB）
+#define LAUNCHER_DEFAULT_HEAP (1u << 26)
+#define LAUNCHER_DEFAULT_PREEMPTION_US 10000
+
+typedef struct {
+  vm *vm;
+  rr_scheduler *scheduler;
+  vm_thread *thread;
+} launcher;
+
+static slice cslice(const char *s) { return (slice){.chars = (char *)s, .len = (int)strlen(s)}; }
+
+// `-Xmx512m` の `512m`。接尾辞は k・m・g（大文字も）。読めなければ 0
+static u64 parse_size(const char *text) {
+  char *end;
+  unsigned long long value = strtoull(text, &end, 10);
+  if (end == text)
+    return 0;
+  switch (*end) {
+  case 'k':
+  case 'K':
+    value <<= 10;
+    end++;
+    break;
+  case 'm':
+  case 'M':
+    value <<= 20;
+    end++;
+    break;
+  case 'g':
+  case 'G':
+    value <<= 30;
+    end++;
+    break;
+  default:
+    break;
+  }
+  return *end ? 0 : (u64)value;
+}
+
+static void sleep_us(u64 us) {
+  struct timespec ts = {.tv_sec = (time_t)(us / 1000000), .tv_nsec = (long)(us % 1000000) * 1000};
+  nanosleep(&ts, nullptr);
+}
+
+/*
+ * メソッドをスケジューラに載せ、終わるまで回す。main が return しても、デーモンでないスレッドが残っていれば
+ * JVM は生きている（java ランチャーの決まり）ので、記録の完了ではなくスケジューラの DONE まで回す。
+ * System.exit（halt0）のあとは呼んだスレッドが眠り続けるだけなので、そこで止める
+ *
+ * `args` は呼ぶ側が用意する。スケジューラは中身を写して持つだけで、この生ポインタは GC の根にならない
+ */
+static void pump(launcher *l, cp_method *method, stack_value *args) {
+  execution_record *record = rr_scheduler_run(l->scheduler, (call_interpreter_t){.args = {l->thread, method, args}});
+  for (;;) {
+    if (rr_scheduler_step(l->scheduler) == SCHEDULER_RESULT_DONE)
+      break;
+    if (l->vm->exit_status >= 0)
+      break;
+    u64 us = rr_scheduler_may_sleep_us(l->scheduler);
+    if (us > 0)
+      sleep_us(us > LAUNCHER_IDLE_SLEEP_US ? LAUNCHER_IDLE_SLEEP_US : us);
+  }
+  free_execution_record(record);
+}
+
+// 引数が String だけの static メソッドを、その場で最後まで走らせる（main の前に済ませる System.setProperty など）。
+// 例外を投げた・クラスかメソッドが無ければ false（例外はスレッドに残る）
+static bool call_static_strings(launcher *l, const char *class_name, const char *name, const char *descriptor,
+                                const char *const *strings, int count) {
+  classdesc *cd = ffi_get_class(l->thread, class_name);
+  if (!cd || l->thread->current_exception)
+    return false;
+  cp_method *method = method_lookup(cd, cslice(name), cslice(descriptor), false, false);
+  if (!method)
+    return false;
+
+  size_t packed_len = 1;
+  for (int i = 0; i < count; i++)
+    packed_len += strlen(strings[i]) + 1;
+  char *packed = malloc(packed_len);
+  char *cursor = packed;
+  for (int i = 0; i < count; i++) {
+    size_t len = strlen(strings[i]);
+    memcpy(cursor, strings[i], len + 1);
+    cursor += len + 1;
+  }
+  // String は C の側でまとめて作る（作るたびに GC が動きうるので、1 つずつだと前の生ポインタが古くなる）。
+  // 取り出してから載せるまでの間に Java の確保は無い
+  object array = ffi_create_string_array(l->thread, packed, count);
+  free(packed);
+  if (!array)
+    return false;
+  stack_value args[8] = {};
+  for (int i = 0; i < count && i < 8; i++)
+    args[i].obj = ((object *)ArrayData(array))[i];
+
+  execution_record *record = rr_scheduler_run(l->scheduler, (call_interpreter_t){.args = {l->thread, method, args}});
+  rr_scheduler_execute_immediately(record);
+  free_execution_record(record);
+  return !l->thread->current_exception;
+}
+
+static char *dotted(const char *internal) {
+  char *copy = strdup(internal);
+  for (char *p = copy; *p; p++)
+    if (*p == '/')
+      *p = '.';
+  return copy;
+}
+
+// 投げっぱなしの例外を、本物の java ランチャーと同じ形で出す。例外が無ければ 0、あれば 1
+static int report_exception(launcher *l) {
+  obj_header *exception = l->thread->current_exception;
+  if (!exception)
+    return 0;
+  // printStackTrace は Java のヒープを確保するので、例外はハンドルで持つ（GC が動かすと生ポインタは古くなる）
+  handle *h = make_handle(l->thread, exception);
+  // 例外を持ったまま Java を呼ぶとすぐに伝わるので、先に降ろす
+  l->thread->current_exception = nullptr;
+  fputs("Exception in thread \"main\" ", stderr);
+  cp_method *print = method_lookup(h->obj->descriptor, STR("printStackTrace"), STR("()V"), true, false);
+  if (!print) {
+    char *name = dotted(h->obj->descriptor->name.chars);
+    fprintf(stderr, "%s\n", name);
+    free(name);
+  } else {
+    stack_value args[1] = {{.obj = h->obj}};
+    pump(l, print, args);
+    // トレースを出す途中の二次的な例外は捨てる（元の失敗のほうが大事）
+    l->thread->current_exception = nullptr;
+  }
+  drop_handle(l->thread, h);
+  return 1;
+}
+
+// クラスを読み込み、初期化（<clinit>）まで済ませる。無ければ本物と同じ文面を出して nullptr
+static classdesc *load_main_class(launcher *l, const char *name) {
+  classdesc *cd = ffi_get_class(l->thread, name);
+  if (!cd) {
+    l->thread->current_exception = nullptr;
+    char *d = dotted(name);
+    fprintf(stderr, "Error: Could not find or load main class %s\nCaused by: java.lang.ClassNotFoundException: %s\n", d, d);
+    free(d);
+  }
+  return cd;
+}
+
+static int run_main(launcher *l, const char *class_name, int argc, char **argv) {
+  classdesc *cd = load_main_class(l, class_name);
+  if (!cd)
+    return 1;
+  // <clinit> が例外で止まった
+  if (l->thread->current_exception)
+    return report_exception(l);
+
+  cp_method *main_method = method_lookup(cd, STR("main"), STR("([Ljava/lang/String;)V"), true, false);
+  if (!main_method || !(main_method->access_flags & ACCESS_STATIC)) {
+    char *d = dotted(class_name);
+    fprintf(stderr,
+            "Error: Main method not found in class %s, please define the main method as:\n"
+            "   public static void main(String[] args)\n"
+            "or a JavaFX application class must extend javafx.application.Application\n",
+            d);
+    free(d);
+    return 1;
+  }
+  if (!(main_method->access_flags & ACCESS_PUBLIC)) {
+    char *d = dotted(class_name);
+    fprintf(stderr,
+            "Error: Main method is not public in class %s, please define the main method as:\n"
+            "   public static void main(String[] args)\n",
+            d);
+    free(d);
+    return 1;
+  }
+
+  size_t packed_len = 1;
+  for (int i = 0; i < argc; i++)
+    packed_len += strlen(argv[i]) + 1;
+  char *packed = malloc(packed_len);
+  char *cursor = packed;
+  for (int i = 0; i < argc; i++) {
+    size_t len = strlen(argv[i]);
+    memcpy(cursor, argv[i], len + 1);
+    cursor += len + 1;
+  }
+  // String[] はスケジューラに載せる直前に作る（あいだに Java の確保を挟むと、GC が動かして古くなる）
+  object array = ffi_create_string_array(l->thread, packed, argc);
+  free(packed);
+  if (!array) {
+    fputs("Error: failed to allocate the argument array\n", stderr);
+    return 1;
+  }
+  stack_value args[1] = {{.obj = array}};
+  pump(l, main_method, args);
+
+  int pending = report_exception(l);
+  // System.exit(n) が呼ばれていれば、それが終了コード（コンパイラのような道具はこれでしか失敗を伝えない）
+  int status = ffi_take_exit_status(l->vm);
+  return status >= 0 ? status : pending;
+}
+
+static int usage(void) {
+  fputs("Usage: bjvm [-cp <classpath>] [-Xmx<size>] [-D<name>=<value>]... [-javaagent:<jar>[=<options>]]... "
+        "[--dry-run] [--and-then <n>] <main class> [args...] [next bjvm args (n)]\n",
+        stderr);
+  return 1;
+}
+
+static int launch(int argc, char **argv) {
+  const char *classpath = ".";
+  u64 heap_size = LAUNCHER_DEFAULT_HEAP;
+  bool dry_run = false;
+  int then_count = 0;
+  char **properties = nullptr; // -D の中身（`名前=値`）
+  char **agents = nullptr;     // -javaagent: の中身
+  int i = 1;
+  for (; i < argc; i++) {
+    const char *arg = argv[i];
+    if (arg[0] != '-')
+      break;
+    if (!strcmp(arg, "-cp") || !strcmp(arg, "-classpath") || !strcmp(arg, "--class-path")) {
+      if (++i >= argc)
+        return usage();
+      classpath = argv[i];
+    } else if (!strncmp(arg, "-Xmx", 4)) {
+      heap_size = parse_size(arg + 4);
+      if (!heap_size) {
+        fprintf(stderr, "Invalid maximum heap size: %s\nError: Could not create the Java Virtual Machine.\n", arg);
+        return 1;
+      }
+    } else if (!strncmp(arg, "-D", 2)) {
+      arrput(properties, (char *)arg + 2);
+    } else if (!strncmp(arg, "-javaagent:", 11)) {
+      arrput(agents, (char *)arg + 11);
+    } else if (!strcmp(arg, "--dry-run")) {
+      dry_run = true;
+    } else if (!strcmp(arg, "--and-then")) {
+      if (++i >= argc || (then_count = atoi(argv[i])) < 0)
+        return usage();
+    } else {
+      fprintf(stderr, "Unrecognized option: %s\n", arg);
+      return usage();
+    }
+  }
+  if (i >= argc - then_count)
+    return usage();
+  const char *main_class = argv[i++];
+  int main_argc = argc - then_count - i;
+  char **then_argv = argv + argc - then_count;
+
+  vm *vm = ffi_create_vm(classpath, heap_size, nullptr, nullptr);
+  if (!vm) {
+    fputs("Error occurred during initialization of VM\nCould not reserve enough space for object heap\n", stderr);
+    return 1;
+  }
+  launcher l = {.vm = vm, .scheduler = ffi_create_rr_scheduler(vm)};
+  const char *preemption = getenv("BJVM_PREEMPTION_US");
+  ffi_set_preemption_frequency_usec(l.scheduler, preemption && atoi(preemption) > 0 ? atoi(preemption)
+                                                                                    : LAUNCHER_DEFAULT_PREEMPTION_US);
+  l.thread = ffi_create_thread(vm);
+  if (!l.thread) {
+    fputs("Error occurred during initialization of VM\nfailed to create the main thread\n", stderr);
+    return 1;
+  }
+
+  // -D は VM を作ったあと、main の前に System.setProperty で上書きする（b-jvm はプロパティを VM を作るときに固める）
+  for (int p = 0; p < arrlen(properties); p++) {
+    char *eq = strchr(properties[p], '=');
+    char *name = eq ? strndup(properties[p], eq - properties[p]) : strdup(properties[p]);
+    const char *strings[2] = {name, eq ? eq + 1 : ""};
+    if (!call_static_strings(&l, "java/lang/System", "setProperty",
+                             "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;", strings, 2))
+      l.thread->current_exception = nullptr;
+    free(name);
+  }
+  arrfree(properties);
+
+  // -javaagent は main の前に premain を起こす。失敗すると本物と同じく VM の起動の失敗で終わる
+  for (int a = 0; a < arrlen(agents); a++) {
+    const char *strings[1] = {agents[a]};
+    if (!call_static_strings(&l, "sun/instrument/InstrumentationImpl", "loadAgent", "(Ljava/lang/String;)V", strings,
+                             1)) {
+      fputs("Error occurred during initialization of VM\nagent library failed to init: instrument\n", stderr);
+      report_exception(&l);
+      return 1;
+    }
+  }
+  arrfree(agents);
+
+  if (dry_run)
+    // クラスの読み込みまで確かめて終わる（main は走らせない）
+    return load_main_class(&l, main_class) ? 0 : 1;
+  int code = run_main(&l, main_class, main_argc, argv + i);
+  if (code != 0 || then_count == 0)
+    return code;
+  // 次の VM へ入れ替わる。argv[0] は自分と同じ名前、末尾は NULL
+  char **next = calloc(then_count + 2, sizeof(char *));
+  next[0] = argv[0];
+  memcpy(next + 1, then_argv, then_count * sizeof(char *));
+  fflush(nullptr);
+  execv("/proc/self/exe", next);
+  fprintf(stderr, "bjvm: cannot run the next VM: %s\n", strerror(errno));
+  return 126;
+}
+
+/*
+ * 引数は 2 つにする。clang は wasm で引数を取る main を `__main_argc_argv` という名前にするが、
+ * それは引数が 2 つのときだけで、`envp` まで取る 3 引数の main は `main` のまま出る。crt1 は
+ * `__main_argc_argv` か `__main_void` しか呼ばないので、3 引数にすると main が呼ばれない
+ */
+int main(int argc, char **argv) {
+  int code = launch(argc, argv);
+  /*
+   * 生きている VM の下でデストラクタ（fini_modules）を回さずに終わる。本物の JVM も、Java の終わりの処理
+   * （シャットダウンフック）を済ませてから exit する。Java の標準出力は write(2) で直に出ているので、
+   * 書き残しは C の stdio の分だけである
+   */
+  fflush(nullptr);
+  jit_report_stats();
+  _exit(code);
+}
+#endif

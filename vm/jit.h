@@ -1,4 +1,4 @@
-// A baseline JIT that compiles hot methods to wasm functions (wasm reactors only). See jit.c.
+// A baseline JIT that compiles hot methods to wasm functions (wasm32 Linux builds only). See jit.c.
 #pragma once
 
 #include "bjvm.h"
@@ -33,6 +33,13 @@ int jit_rt_invoke(vm_thread *thread, stack_frame *frame, int pc);
 // the driver instead
 extern int jit_nesting;
 #define JIT_MAX_NESTING 64
+
+// Loads a module of `count` compiled methods (see jit_load.c) and writes the table index of each exported function
+// `f<i>` to indices[i]. Returns false when the module could not be loaded
+bool jit_load(const u8 *bytes, u32 len, int count, s32 *indices);
+
+// When BJVM_JIT_STATS is set, prints to stderr how many compiled methods were loaded and how many failed to load
+void jit_report_stats(void);
 
 // The interpreter stopped the frame for a fuel check (it ran a long loop): compile its method right away
 void jit_note_hot_loop(stack_frame *frame);

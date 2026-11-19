@@ -138,21 +138,10 @@ DECLARE_NATIVE("java/io", FileInputStream, available0, "()I") {
   if (unix_fd == 0 && thread->vm->poll_available_stdin) {
     available = thread->vm->poll_available_stdin(thread->vm->stdio_override_param);
   } else {
-    int err = ioctl(unix_fd, FIONREAD, &available);
-    if (err < 0) {
-      // wasi-libc の preview2 系は FIONREAD を実装しておらず ENOTSUP を返す
-      // （preview1 は成功するが常に 0 を返す）。通常ファイルであれば
-      // 「サイズ - 現在位置」が available と一致するので、そちらで代替する。
-      // ここで例外にすると、クラスパスからリソースを読む処理がまるごと失敗する
-      struct stat st;
-      off_t position = lseek(unix_fd, 0, SEEK_CUR);
-      if (position >= 0 && fstat(unix_fd, &st) == 0 && S_ISREG(st.st_mode)) {
-        off_t remaining = st.st_size - position;
-        available = remaining > 0 ? (int)remaining : 0;
-      } else {
-        raise_vm_exception(thread, STR("java/io/IOException"), STR("Error getting available bytes"));
-        return value_null();
-      }
+    // FIONREAD answers "size - position" for a regular file too (Linux's do_vfs_ioctl)
+    if (ioctl(unix_fd, FIONREAD, &available) < 0) {
+      raise_vm_exception(thread, STR("java/io/IOException"), STR("Error getting available bytes"));
+      return value_null();
     }
   }
 

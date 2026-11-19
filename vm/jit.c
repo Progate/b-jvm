@@ -1,4 +1,4 @@
-// A baseline JIT: compiles a hot method to a wasm function and hands it to the host to instantiate.
+// A baseline JIT: compiles a hot method to a wasm function and loads it with dlopen(3).
 //
 // The compiled code works on the interpreter's own frame: every local and operand stack value lives in the frame
 // memory, in the slots the interpreter uses, at every instruction boundary. That keeps three things simple:
@@ -16,9 +16,13 @@
 // branches are direct `br`s; backward branches decrement the thread's fuel (as the interpreter's branches do) and go
 // through the dispatch.
 //
-// The host side is a single import, bjvm_jit.install(bytes, length), which compiles the module (importing this
-// module's memory and function table), appends its function to the table and returns the table index. Runtime
-// helpers are called with call_indirect on their C function pointers, which are indices into the same table.
+// Compiled methods are gathered into a wasm shared object (a side module with a dylink.0 section, importing the
+// process's memory and function table), which is written to a temporary file and loaded with dlopen(3), the same way
+// a JIT on Linux that cannot write executable memory loads generated code (see jit_load.c). dlsym(3) gives each
+// function pointer, which on wasm is an index into the function table. A method waits in the batch (and keeps running
+// in the interpreter) until the batch is full or the method has run JIT_BATCH_WAIT more times, so that one dlopen
+// loads many methods: the file and the loader cost about as much as compiling, and a compiler run makes a thousand. Runtime helpers are called with call_indirect on their C function pointers, which are indices
+// into the same table.
 
 #include "jit.h"
 
@@ -30,14 +34,14 @@
 
 #include <math.h>
 #include <stddef.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-// bjvm_jit.install is a host import that exists on every wasm reactor the BrowserOS host runs
-// (WASI or Linux-musl); Emscripten and native builds keep the interpreter only.
+// The compiled code is wasm, so only the wasm32 Linux build (BrowserOS) can load it; Emscripten and native builds keep
+// the interpreter only.
 #if defined(__wasm__) && !defined(EMSCRIPTEN)
 #define JIT_SUPPORTED 1
-__attribute__((import_module("bjvm_jit"), import_name("install"))) int32_t jit_host_install(const u8 *bytes, u32 len);
 #else
 #define JIT_SUPPORTED 0
 #endif
@@ -305,7 +309,7 @@ enum { SLOT_NONE = 0, SLOT_CLEAN = 1, SLOT_DIRTY = 2 };
  * Compilation context
  * ------------------------------------------------------------------------------------------------------------------ */
 
-#define MAX_SIGS 16
+#define MAX_SIGS 64
 
 typedef struct {
   cp_method *method;
@@ -322,9 +326,6 @@ typedef struct {
   u32 stack_offset; // offset of frame->stack[0] from L_BASE
   u32 slot_count;   // locals + max_stack
   u8 *slot_state;   // SLOT_* of each frame slot
-
-  const char *sigs[MAX_SIGS];
-  int sig_count;
 
   jbuf body;
   bool failed;
@@ -365,14 +366,34 @@ static void fc(jctx *c, u8 sub) {
   op_u(c, sub);
 }
 
+/*
+ * The methods waiting to be loaded together (see the top of the file). The function types are shared by the whole
+ * batch: type 0 is the compiled function's, and the rest are the runtime helpers' signatures the bodies call through
+ */
+#define JIT_BATCH_SIZE 64
+#define JIT_BATCH_WAIT 1000
+#define JIT_PENDING (-2)
+
+typedef struct {
+  cp_method *method;
+  jbuf function; // the code section entry: local declarations and body
+} jit_pending;
+
+static struct {
+  const char *sigs[MAX_SIGS];
+  int sig_count;
+  jit_pending *pending; // stb_ds array
+} batch;
+
 // Index of a function type, e.g. "iii:i" (params : results; i = i32, l = i64, f = f32, d = f64)
 static int sig_index(jctx *c, const char *sig) {
-  for (int i = 0; i < c->sig_count; ++i)
-    if (strcmp(c->sigs[i], sig) == 0)
+  (void)c;
+  for (int i = 0; i < batch.sig_count; ++i)
+    if (strcmp(batch.sigs[i], sig) == 0)
       return i;
-  CHECK(c->sig_count < MAX_SIGS);
-  c->sigs[c->sig_count] = sig;
-  return c->sig_count++;
+  CHECK(batch.sig_count < MAX_SIGS);
+  batch.sigs[batch.sig_count] = sig;
+  return batch.sig_count++;
 }
 
 // Calls a runtime helper (arguments already pushed)
@@ -2153,15 +2174,27 @@ static void name(jbuf *b, const char *s) {
   jb_bytes(b, s, strlen(s));
 }
 
-static jbuf build_module(jctx *c) {
+static jbuf build_module(void) {
   jbuf module = {0}, s = {0};
   static const u8 header[] = {0x00, 'a', 's', 'm', 0x01, 0x00, 0x00, 0x00};
   jb_bytes(&module, header, sizeof(header));
+  int count = (int)arrlen(batch.pending);
+
+  // dylink.0: a shared object that needs no memory and no table slots of its own (the loader appends the exported
+  // functions to the table when dlsym asks for them)
+  name(&s, "dylink.0");
+  jb_byte(&s, 1); // WASM_DYLINK_MEM_INFO
+  jb_uleb(&s, 4);
+  jb_uleb(&s, 0); // memory size
+  jb_uleb(&s, 0); // memory alignment
+  jb_uleb(&s, 0); // table size
+  jb_uleb(&s, 0); // table alignment
+  section(&module, 0, &s);
 
   // types
-  jb_uleb(&s, c->sig_count);
-  for (int i = 0; i < c->sig_count; ++i) {
-    const char *sig = c->sigs[i], *colon = strchr(sig, ':');
+  jb_uleb(&s, batch.sig_count);
+  for (int i = 0; i < batch.sig_count; ++i) {
+    const char *sig = batch.sigs[i], *colon = strchr(sig, ':');
     jb_byte(&s, 0x60);
     jb_uleb(&s, colon - sig);
     for (const char *p = sig; p < colon; ++p)
@@ -2172,82 +2205,92 @@ static jbuf build_module(jctx *c) {
   }
   section(&module, 1, &s);
 
-  // imports: env.memory, env.table
+  // imports: env.memory, env.__indirect_function_table (what the loader gives every module of the process)
   jb_uleb(&s, 2);
   name(&s, "env");
   name(&s, "memory");
   jb_byte(&s, 0x02); // memory
   // shared, with a maximum: the VM's memory is the BrowserOS world's shared memory, and a shared memory can only be
-  // imported where the import is declared shared too (otherwise instantiation fails and nothing is ever compiled).
-  // The maximum is the wasm32 limit, so it is never below the actual memory's
+  // imported where the import is declared shared too. The maximum is the wasm32 limit, so it is never below the
+  // actual memory's
   jb_byte(&s, 0x03);
   jb_uleb(&s, 0);
   jb_uleb(&s, 65536);
   name(&s, "env");
-  name(&s, "table");
+  name(&s, "__indirect_function_table");
   jb_byte(&s, 0x01); // table
   jb_byte(&s, 0x70); // funcref
   jb_byte(&s, 0x00);
   jb_uleb(&s, 0);
   section(&module, 2, &s);
 
-  // functions: one, of type 0
-  jb_uleb(&s, 1);
-  jb_uleb(&s, 0);
+  // functions: all of type 0
+  jb_uleb(&s, count);
+  for (int i = 0; i < count; ++i)
+    jb_uleb(&s, 0);
   section(&module, 3, &s);
 
-  // exports: "f"
-  jb_uleb(&s, 1);
-  name(&s, "f");
-  jb_byte(&s, 0x00);
-  jb_uleb(&s, 0);
+  // exports: "f0", "f1", ...
+  jb_uleb(&s, count);
+  for (int i = 0; i < count; ++i) {
+    char export_name[16];
+    snprintf(export_name, sizeof(export_name), "f%d", i);
+    name(&s, export_name);
+    jb_byte(&s, 0x00);
+    jb_uleb(&s, i);
+  }
   section(&module, 7, &s);
 
   // code
-  jbuf fn = {0};
-  jb_uleb(&fn, c->slot_count ? 5 : 4); // local groups, in the order of the L_* indices
-  jb_uleb(&fn, L_COUNT_I32);
-  jb_byte(&fn, VT_I32);
-  jb_uleb(&fn, L_COUNT_I64);
-  jb_byte(&fn, VT_I64);
-  jb_uleb(&fn, 1);
-  jb_byte(&fn, VT_F32);
-  jb_uleb(&fn, 1);
-  jb_byte(&fn, VT_F64);
-  if (c->slot_count) {
-    jb_uleb(&fn, c->slot_count);
-    jb_byte(&fn, VT_I64);
+  jb_uleb(&s, count);
+  for (int i = 0; i < count; ++i) {
+    jb_uleb(&s, batch.pending[i].function.len);
+    jb_bytes(&s, batch.pending[i].function.data, batch.pending[i].function.len);
   }
-  jb_bytes(&fn, c->body.data, c->body.len);
-  jb_uleb(&s, 1);
-  jb_uleb(&s, fn.len);
-  jb_bytes(&s, fn.data, fn.len);
-  free(fn.data);
   section(&module, 10, &s);
 
-  // name: the function is called after the Java method (`pkg/Class.method`), so that it shows in profilers
+  // name: each function is called after its Java method (`pkg/Class.method`), so that it shows in profilers
   {
     jbuf names = {0};
-    jbuf full = {0};
-    slice cls = c->method->my_class->name, m = c->method->name;
-    jb_bytes(&full, cls.chars, cls.len);
-    jb_byte(&full, '.');
-    jb_bytes(&full, m.chars, m.len);
-    jb_uleb(&names, 1); // one function
-    jb_uleb(&names, 0); // its index
-    jb_uleb(&names, full.len);
-    jb_bytes(&names, full.data, full.len);
+    jb_uleb(&names, count);
+    for (int i = 0; i < count; ++i) {
+      cp_method *method = batch.pending[i].method;
+      slice cls = method->my_class->name, m = method->name;
+      jb_uleb(&names, i);
+      jb_uleb(&names, cls.len + 1 + m.len);
+      jb_bytes(&names, cls.chars, cls.len);
+      jb_byte(&names, '.');
+      jb_bytes(&names, m.chars, m.len);
+    }
     name(&s, "name");
     jb_byte(&s, 1); // subsection: function names
     jb_uleb(&s, names.len);
     jb_bytes(&s, names.data, names.len);
     section(&module, 0, &s);
     free(names.data);
-    free(full.data);
   }
 
   free(s.data);
   return module;
+}
+
+// Loads the waiting methods with one dlopen and gives each its function. A method whose module could not be loaded
+// stays interpreted
+static void jit_flush(void) {
+  int count = (int)arrlen(batch.pending);
+  if (count == 0)
+    return;
+  jbuf module = build_module();
+  s32 *indices = calloc(count, sizeof(s32));
+  bool loaded = jit_load(module.data, module.len, count, indices);
+  free(module.data);
+  for (int i = 0; i < count; ++i) {
+    cp_method *method = batch.pending[i].method;
+    method->jit_function = loaded && indices[i] > 0 ? indices[i] : -1;
+    free(batch.pending[i].function.data);
+  }
+  free(indices);
+  arrsetlen(batch.pending, 0);
 }
 
 static bool compilable(cp_method *method) {
@@ -2279,7 +2322,7 @@ static s32 compile(cp_method *method) {
   c->stack_offset = 8 * c->locals_count + offsetof(stack_frame, stack);
   c->slot_count = code->max_locals + code->max_stack;
   c->slot_state = calloc(c->slot_count + 1, 1);
-  sig_index(c, "iii:i"); // type 0: the compiled function
+  sig_index(c, "iii:i"); // type 0: the compiled function (registered first in every batch)
 
   // Basic block leaders
   int n = c->insn_count;
@@ -2352,19 +2395,32 @@ static s32 compile(cp_method *method) {
   i32_const(c, JIT_STATUS_BAIL);
   op(c, OP_END);
 
-  jbuf module = build_module(c);
-  free(c->body.data);
   free(c->block_of_pc);
   free(c->slot_state);
+  if (c->failed) {
+    free(c->body.data);
+    return -1;
+  }
 
-  // jit_host_install は wasm 側の import 関数なので、ネイティブビルド（JIT_SUPPORTED=0）
-  // ではそもそも宣言自体が存在しない
-  s32 index = -1;
-#if JIT_SUPPORTED
-  index = c->failed ? -1 : jit_host_install(module.data, module.len);
-#endif
-  free(module.data);
-  return index > 0 ? index : -1;
+  // The code section entry: local groups, in the order of the L_* indices, then the body
+  jbuf fn = {0};
+  jb_uleb(&fn, c->slot_count ? 5 : 4);
+  jb_uleb(&fn, L_COUNT_I32);
+  jb_byte(&fn, VT_I32);
+  jb_uleb(&fn, L_COUNT_I64);
+  jb_byte(&fn, VT_I64);
+  jb_uleb(&fn, 1);
+  jb_byte(&fn, VT_F32);
+  jb_uleb(&fn, 1);
+  jb_byte(&fn, VT_F64);
+  if (c->slot_count) {
+    jb_uleb(&fn, c->slot_count);
+    jb_byte(&fn, VT_I64);
+  }
+  jb_bytes(&fn, c->body.data, c->body.len);
+  free(c->body.data);
+  arrput(batch.pending, ((jit_pending){.method = method, .function = fn}));
+  return JIT_PENDING;
 }
 
 /* ------------------------------------------------------------------------------------------------------------------
@@ -2385,13 +2441,22 @@ int jit_try_run(vm_thread *thread, stack_frame *frame) {
     return -1;
   cp_method *method = frame->method;
   if (unlikely(method->jit_function <= 0)) {
-    if (method->jit_function < 0)
-      return -1;
-    if (++method->jit_hotness < JIT_THRESHOLD)
-      return -1;
-    method->jit_compiles++;
-    method->jit_function = compile(method);
-    if (method->jit_function < 0)
+    if (method->jit_function == JIT_PENDING) {
+      // Waiting in the batch: load the batch once the method has run a while more
+      if (++method->jit_hotness < JIT_THRESHOLD + JIT_BATCH_WAIT)
+        return -1;
+      jit_flush();
+    } else {
+      if (method->jit_function < 0)
+        return -1;
+      if (++method->jit_hotness < JIT_THRESHOLD)
+        return -1;
+      method->jit_compiles++;
+      method->jit_function = compile(method);
+      if (method->jit_function == JIT_PENDING && arrlen(batch.pending) >= JIT_BATCH_SIZE)
+        jit_flush();
+    }
+    if (method->jit_function <= 0)
       return -1;
   }
   int status = ((jit_function)(uintptr_t)method->jit_function)(thread, frame, frame->program_counter);
@@ -2412,4 +2477,6 @@ int jit_try_run(vm_thread *thread, stack_frame *frame) {
 void jit_note_hot_loop(stack_frame *frame) {
   if (frame->method->jit_function == 0)
     frame->method->jit_hotness = JIT_THRESHOLD;
+  else if (frame->method->jit_function == JIT_PENDING)
+    frame->method->jit_hotness = JIT_THRESHOLD + JIT_BATCH_WAIT;
 }

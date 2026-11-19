@@ -399,6 +399,32 @@ Spring Boot 4.1（webmvc・Thymeleaf・Spring Data JPA / Hibernate 7・H2）を�
 - `vm/bjvm.c` … `resolve_mh_invoke` が Method の `clazz` に定数が名指すクラスを渡していた。`slot` は宣言クラスの
   methods の番号なので、継承したメソッドの参照（`Sub::inherited`）では別のメソッドを指して壊れる。宣言クラスを渡す
 
+## Linux のプログラムとして起こす（2026-11 追加分）
+
+ホストが `_start` を 1 度走らせてから `ffi_*` を呼んで駆動する形をやめ、BrowserOS のカーネルが execve(2) で起こす
+ふつうの Linux のプログラムにした差分。`main` が VM を作って Java の main を最後まで走らせ、終了コードで終わる。
+どのクラスを走らせるかを決めるまで（`-jar`・`-m`・`@引数ファイル`・`JDK_JAVA_OPTIONS`）は
+（Progate/packages の）`packages/browser-java/src/os-executable.ts` のランチャーが片付けてから入れ替わる。
+JS のホストから呼ぶ口（`bjvm_jit.install`）が無くなったので、ホストに頼むものは何も残っていない。
+
+- `vm/bin/main.c` … `main` が `bjvm [-cp …] [-Xmx…] [-D…]… [-javaagent:…]… [--dry-run] [--and-then <n>] <main> [引数…]`
+  を受けて走らせる。スケジューラは「次はこれだけ待ってよい」分を nanosleep(2) で眠る。`-D` は `System.setProperty`、
+  `-javaagent` は `InstrumentationImpl.loadAgent` を main の前に呼ぶ。捕まらなかった例外は本物のランチャーと同じく
+  `Exception in thread "main"` に続けて printStackTrace。`--and-then <n>` は main が 0 で終わったら末尾の n 個を引数に
+  `/proc/self/exe` へ入れ替わる（`java Foo.java` の「ECJ でコンパイルしてから別の VM で走らせる」を 1 つのプロセスで）。
+  終わりは `_exit`（生きている VM の下でデストラクタを回さない）。Emscripten のビルドは従来どおり印だけの main
+- `vm/jit.c`・`vm/jit_load.c` … コンパイルしたメソッドを、dylink.0 を持つ wasm の共有オブジェクト（メモリと関数表を
+  `env.memory`・`env.__indirect_function_table` で import し、`f0`・`f1`… を export する）にして一時ファイルへ書き、
+  dlopen(3) で読む（実行できるメモリを書けない Linux の JIT が生成したコードを読むのと同じ形）。関数のポインタは
+  dlsym(3) で引く。dlopen 1 回はコンパイルと同じくらい掛かり、javac 1 回で約 1000 メソッドを組むので、メソッドを
+  `JIT_BATCH_SIZE`（64）まで溜めてまとめて読む。溜まっている間はインタプリタで走り、さらに `JIT_BATCH_WAIT`（1000）回
+  入ったら溜まった分を読む。`BJVM_JIT_STATS` を置くと、終わるときに読んだ数・読めなかった数・モジュールの数を stderr へ出す
+- `natives/share/sun/nio/ch/UnixFileDispatcherImpl.c` … `lock0`・`release0` を fcntl(2) のレコードロックにした
+  （OpenJDK と同じ。以前は「WASI に口が無い」として成功したふりをしていた）
+- `natives/share/java/io/FileInputStream.c` … `available0` の「FIONREAD が失敗したらサイズ - 位置」の代わりを外した
+  （カーネルの FIONREAD が普通のファイルにも Linux と同じく答える）
+- `cmake/LinuxMuslSupport.cmake` … 説明を「カーネルが起こすプログラム」に直した。`-rdynamic` は名前を見せるために残す
+
 ## upstream に追従するとき
 
 上記の変更はいずれも既存コードへの小さな条件分岐で、`vm/interpreter2.c` 以外は独立している。

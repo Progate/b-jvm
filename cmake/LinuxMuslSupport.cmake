@@ -1,13 +1,12 @@
 # Build settings for the wasm32-unknown-linux-musl target (BrowserOS's musl libc).
 #
 # This is a third target alongside native and Emscripten. Compared to Emscripten it drops the JS glue
-# entirely, and every syscall it makes goes through browser_os_linux.syscall, which the host
-# implements. The output is a *dynamic* executable (`-pie` with `NEEDED libc.so`): the BrowserOS
-# loader (browser-dyld) creates the linear memory, the function table and the stack, resolves
-# libc.so, applies relocations, and the host calls `_start` once to run libc setup and all module
-# constructors. After that the host drives the exported ffi_* functions (see vm/bin/main.c — main
-# itself is only a marker that initialization finished). See vm/types.h for the BJVM_WASM macro
-# that separates "targeting wasm" from "running under the Emscripten runtime".
+# entirely, and every syscall it makes goes through browser_os_linux.syscall, the BrowserOS kernel's
+# Linux syscall entry. The output is a *dynamic* executable (`-pie` with `NEEDED libc.so`) that the
+# kernel starts with execve(2), like any Linux program: the loader (browser-dyld) creates the linear
+# memory, the function table and the stack, resolves libc.so and libz.so, and `_start` runs `main`
+# (vm/bin/main.c), which runs the VM to the end. See vm/types.h for the BJVM_WASM macro that
+# separates "targeting wasm" from "running under the Emscripten runtime".
 
 function(configure_linux_musl_build)
     add_compile_options(
@@ -32,10 +31,8 @@ function(configure_linux_musl_pie TARGET)
     # module, the exception tag __c_longjmp (setjmp/longjmp) and the FP exception flag global
     # __fe_status, need nothing here: wasm-ld imports them by name in PIC links.
     target_link_options(${TARGET} PRIVATE
-            # The ffi_* entry points are marked EMSCRIPTEN_KEEPALIVE, which on this target expands to
-            # used + default visibility. -rdynamic is what turns that into actual wasm exports, and
-            # also leaves the rest of b-jvm visible so the JIT's compiled code and the loader can
-            # resolve runtime helpers by name.
+            # Export b-jvm's symbols, as a Linux program linked with -rdynamic does, so that a debugger,
+            # a profiler and dladdr(3) see them by name.
             -rdynamic
     )
     set_target_properties(${TARGET} PROPERTIES SUFFIX ".wasm")
